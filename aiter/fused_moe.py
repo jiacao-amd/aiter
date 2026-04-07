@@ -529,6 +529,41 @@ def get_block_size_M(token, topk, expert, inter_dim):
     return sorted(tmp, key=lambda x: x[:2])[0][-1]
 
 
+_CKTILE_PAD_ALIGNMENTS = (256, 128, 64)
+
+
+@functools.lru_cache(maxsize=2048)
+def get_cktile_pad_zeros(total_dim: int, pad_zeros: int) -> int:
+    if pad_zeros <= 0:
+        return 0
+
+    effective_dim = total_dim - pad_zeros
+    # Prefer the largest alignment the unpadded dimension still supports so
+    # padded shapes are handled generically rather than via model-specific cases.
+    for alignment in _CKTILE_PAD_ALIGNMENTS:
+        if alignment <= pad_zeros and effective_dim % alignment == 0:
+            return pad_zeros // alignment * alignment
+
+    return pad_zeros // _CKTILE_PAD_ALIGNMENTS[-1] * _CKTILE_PAD_ALIGNMENTS[-1]
+
+
+@functools.lru_cache(maxsize=2048)
+def get_cktile_stage_pads(
+    model_dim: int,
+    inter_dim: int,
+    hidden_pad: int,
+    intermediate_pad: int,
+    use_g1u1: bool,
+):
+    stage1_n_pad = get_cktile_pad_zeros(inter_dim, intermediate_pad) * (
+        2 if use_g1u1 else 1
+    )
+    stage1_k_pad = get_cktile_pad_zeros(model_dim, hidden_pad)
+    stage2_n_pad = get_cktile_pad_zeros(model_dim, hidden_pad)
+    stage2_k_pad = get_cktile_pad_zeros(inter_dim, intermediate_pad)
+    return stage1_n_pad, stage1_k_pad, stage2_n_pad, stage2_k_pad
+
+
 @functools.lru_cache(maxsize=2048)
 def use_nt(token, topk, e):
     use_nt = int(os.environ.get("AITER_USE_NT", "-1"))
@@ -1001,18 +1036,23 @@ def get_2stage_cfgs(
         and q_type == QuantType.per_1x32
         and activation == ActivationType.Swiglu
     ):
+        stage1_n_pad, stage1_k_pad, stage2_n_pad, stage2_k_pad = (
+            get_cktile_stage_pads(
+                model_dim, inter_dim, hidden_pad, intermediate_pad, use_g1u1
+            )
+        )
         return MOEMetadata(
             functools.partial(
                 cktile_moe_stage1,
-                n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
-                k_pad_zeros=hidden_pad // 128 * 128,
+                n_pad_zeros=stage1_n_pad,
+                k_pad_zeros=stage1_k_pad,
                 activation=activation,
                 split_k=max(ksplit, 1),
             ),
             functools.partial(
                 cktile_moe_stage2,
-                n_pad_zeros=hidden_pad // 64 * 64,
-                k_pad_zeros=intermediate_pad // 128 * 128,
+                n_pad_zeros=stage2_n_pad,
+                k_pad_zeros=stage2_k_pad,
                 activation=activation,
             ),
             get_block_m(),
@@ -1027,18 +1067,23 @@ def get_2stage_cfgs(
         and ksplit > 1
         and is_shuffled
     ):
+        stage1_n_pad, stage1_k_pad, stage2_n_pad, stage2_k_pad = (
+            get_cktile_stage_pads(
+                model_dim, inter_dim, hidden_pad, intermediate_pad, use_g1u1
+            )
+        )
         return MOEMetadata(
             functools.partial(
                 cktile_moe_stage1,
-                n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
-                k_pad_zeros=hidden_pad // 128 * 128,
+                n_pad_zeros=stage1_n_pad,
+                k_pad_zeros=stage1_k_pad,
                 activation=activation,
                 split_k=ksplit,
             ),
             functools.partial(
                 cktile_moe_stage2,
-                n_pad_zeros=hidden_pad // 64 * 64,
-                k_pad_zeros=intermediate_pad // 128 * 128,
+                n_pad_zeros=stage2_n_pad,
+                k_pad_zeros=stage2_k_pad,
                 activation=activation,
             ),
             16 if token < 2048 else 32 if token < 16384 else 64,
