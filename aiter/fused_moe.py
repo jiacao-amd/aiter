@@ -682,6 +682,7 @@ def _fused_moe_impl(
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
+    _metadata_config_file: str | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
 ) -> torch.Tensor:
@@ -855,6 +856,7 @@ def _fused_moe_impl(
         has_stage2_bias=bias2 is not None,
         opus_weights_shuffled=getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),
+        config_file=_metadata_config_file,
     )
 
     if _metadata_transform is not None:
@@ -1010,6 +1012,7 @@ def _fused_moe_impl(
             m_indices=sort_m_indices,
             reverse_sorted=sort_reverse_sorted,
             _metadata_transform=_metadata_transform,
+            _metadata_config_file=_metadata_config_file,
             _stage1_extra_args=_stage1_extra_args,
             _stage2_extra_args=_stage2_extra_args,
         )
@@ -1229,6 +1232,7 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
 
 
 cfg_2stages = None
+cfg_2stages_by_file = {}
 # fmt: off
 fused_moe_1stage_dict = {
     "gfx942":
@@ -2112,6 +2116,7 @@ def get_2stage_cfgs(
     is_ep=False,
     has_stage2_bias=False,
     opus_weights_shuffled=None,
+    config_file=None,
 ):
     gate_mode = GateMode(gate_mode)
     # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
@@ -2184,12 +2189,19 @@ def get_2stage_cfgs(
         return primary, fallback
 
     global cfg_2stages
-    config_path = os.path.dirname(AITER_CONFIGS.AITER_CONFIG_FMOE_FILE)
-    tune_file = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
+    tune_file = config_file or AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
+    config_path = os.path.dirname(tune_file)
     untune_file = os.path.join(config_path, "untuned_fmoe.csv")
     profile_file = os.path.join(config_path, "profile_fmoe.csv")
-    if cfg_2stages is None:
-        cfg_2stages = get_cfg_2stages(tune_file)
+    if config_file is None:
+        if cfg_2stages is None:
+            cfg_2stages = get_cfg_2stages(tune_file)
+        active_cfg_2stages = cfg_2stages
+    else:
+        active_cfg_2stages = cfg_2stages_by_file.get(tune_file)
+        if active_cfg_2stages is None:
+            active_cfg_2stages = get_cfg_2stages(tune_file)
+            cfg_2stages_by_file[tune_file] = active_cfg_2stages
     cu_num = get_cu_num()
     gfx = get_gfx_runtime()
     # EP convention: callers append one always-masked fake-expert slot to
@@ -2273,8 +2285,12 @@ def get_2stage_cfgs(
                     break
         return result
 
-    cfg = _lookup_cfg(cfg_2stages)
-    if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
+    cfg = _lookup_cfg(active_cfg_2stages)
+    if (
+        cfg is None
+        and config_file is None
+        and os.environ.get("AITER_ONLINE_TUNE", "0") == "1"
+    ):
         lock_name = re.sub(r"[^\w.\-]", "_", str(keys))
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{lock_name}")
         mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
@@ -2964,6 +2980,7 @@ def fused_moe_2stages(
     m_indices=None,
     reverse_sorted=None,
     _metadata_transform: Callable | None = None,
+    _metadata_config_file: str | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
 ):
@@ -2998,6 +3015,7 @@ def fused_moe_2stages(
         has_stage2_bias=bias2 is not None,
         opus_weights_shuffled=getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),
+        config_file=_metadata_config_file,
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)

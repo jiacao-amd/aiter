@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Lightweight capabilities shared by FHMoE runtime and AOT setup."""
+"""Capabilities advertised by the FHMoE runtime."""
 
 # Inclusive actual-M ceiling for the no-padding gfx950 DSV4
 # H7168/I384/E385/topk7 interleaved FHMoE path.
