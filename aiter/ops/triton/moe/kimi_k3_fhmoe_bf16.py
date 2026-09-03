@@ -368,6 +368,100 @@ def _kimi_k3_fhmoe_stage2_bf16(
         tl.store(shared_output + offsets_n, accumulator, mask=mask_n)
 
 
+@triton.jit
+def _kimi_k3_fhmoe_stage2_split_routes_bf16(
+    routed_intermediate,
+    shared_intermediate,
+    routed_w2,
+    shared_w2,
+    topk_ids,
+    topk_weights,
+    routed_partials,
+    shared_output,
+    ROUTED_HIDDEN: tl.constexpr,
+    SHARED_HIDDEN: tl.constexpr,
+    INTERMEDIATE: tl.constexpr,
+    TOPK: tl.constexpr,
+    SHARED_EXPERTS: tl.constexpr,
+    ROUTED_BLOCKS: tl.constexpr,
+    ROUTE_SPLITS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Split the long top-k loop across workgroups and emit FP32 partials."""
+
+    program = tl.program_id(0)
+    routed_programs: tl.constexpr = ROUTED_BLOCKS * ROUTE_SPLITS
+    offsets_i = tl.arange(0, BLOCK_K)
+
+    if program < routed_programs:
+        output_block = program // ROUTE_SPLITS
+        route_split = program % ROUTE_SPLITS
+        offsets_n = output_block * BLOCK_N + tl.arange(0, BLOCK_N)
+        accumulator = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        routes_per_split: tl.constexpr = TOPK // ROUTE_SPLITS
+
+        for local_route in range(routes_per_split):
+            route = route_split * routes_per_split + local_route
+            expert = tl.load(topk_ids + route).to(tl.int64)
+            route_weight = tl.load(topk_weights + route).to(tl.float32)
+            expert_accumulator = tl.zeros((BLOCK_N,), dtype=tl.float32)
+            for i_start in range(0, INTERMEDIATE, BLOCK_K):
+                indices_i = i_start + offsets_i
+                intermediate = tl.load(
+                    routed_intermediate + route * INTERMEDIATE + indices_i
+                ).to(tl.float32)
+                weight = tl.load(
+                    routed_w2
+                    + (expert * ROUTED_HIDDEN + offsets_n[:, None]) * INTERMEDIATE
+                    + indices_i[None, :]
+                ).to(tl.float32)
+                expert_accumulator += tl.sum(
+                    weight * intermediate[None, :],
+                    axis=1,
+                )
+            accumulator += route_weight * expert_accumulator
+
+        tl.store(
+            routed_partials + route_split * ROUTED_HIDDEN + offsets_n,
+            accumulator,
+        )
+    else:
+        shared_block = program - routed_programs
+        offsets_n = shared_block * BLOCK_N + tl.arange(0, BLOCK_N)
+        accumulator = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        shared_intermediate_size: tl.constexpr = SHARED_EXPERTS * INTERMEDIATE
+
+        for i_start in range(0, shared_intermediate_size, BLOCK_K):
+            indices_i = i_start + offsets_i
+            intermediate = tl.load(shared_intermediate + indices_i).to(tl.float32)
+            weight = tl.load(
+                shared_w2
+                + offsets_n[:, None] * shared_intermediate_size
+                + indices_i[None, :]
+            ).to(tl.float32)
+            accumulator += tl.sum(weight * intermediate[None, :], axis=1)
+
+        tl.store(shared_output + offsets_n, accumulator)
+
+
+@triton.jit
+def _kimi_k3_fhmoe_stage2_reduce_routes_bf16(
+    routed_partials,
+    routed_output,
+    ROUTED_HIDDEN: tl.constexpr,
+    ROUTE_SPLITS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    offsets_n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    accumulator = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for route_split in range(ROUTE_SPLITS):
+        accumulator += tl.load(
+            routed_partials + route_split * ROUTED_HIDDEN + offsets_n
+        )
+    tl.store(routed_output + offsets_n, accumulator)
+
+
 def _is_gfx950() -> bool:
     try:
         return get_gfx_runtime() == "gfx950"
@@ -569,10 +663,11 @@ def kimi_k3_fhmoe_bf16(
         BLOCK_K=stage1_block_k,
         num_warps=4,
     )
+    stage1_reduce_block_n = 128
     _kimi_k3_fhmoe_stage1_split_reduce_bf16[
         (
             _TOPK + _SHARED_EXPERTS,
-            triton.cdiv(_INTERMEDIATE_PER_TP_RANK, stage1_block_n),
+            triton.cdiv(_INTERMEDIATE_PER_TP_RANK, stage1_reduce_block_n),
         )
     ](
         stage1_partials,
@@ -583,22 +678,29 @@ def kimi_k3_fhmoe_bf16(
         SPLIT_K=_STAGE1_SPLIT_K,
         SITU_BETA=_SITU_BETA,
         SITU_LINEAR_BETA=_SITU_LINEAR_BETA,
-        BLOCK_N=stage1_block_n,
-        num_warps=1,
+        BLOCK_N=stage1_reduce_block_n,
+        num_warps=2,
     )
 
-    stage2_block_n = 16
+    # Split the top-16 routed experts over four workgroups.  The old Stage 1
+    # partial buffer is dead after the SiTU reduction, so reuse its first
+    # 4 * ROUTED_HIDDEN FP32 values for the Stage 2 route partials.
+    stage2_route_splits = 4
+    stage2_block_n = 32
     stage2_block_k = 128
     routed_blocks = triton.cdiv(_ROUTED_HIDDEN, stage2_block_n)
     shared_blocks = triton.cdiv(_SHARED_HIDDEN, stage2_block_n)
-    _kimi_k3_fhmoe_stage2_bf16[(routed_blocks + shared_blocks,)](
+    routed_partials = stage1_partials.view(-1)
+    _kimi_k3_fhmoe_stage2_split_routes_bf16[
+        (routed_blocks * stage2_route_splits + shared_blocks,)
+    ](
         routed_intermediate,
         shared_intermediate,
         routed_w2,
         shared_w2,
         topk_ids,
         topk_weights,
-        routed_out,
+        routed_partials,
         shared_out,
         ROUTED_HIDDEN=_ROUTED_HIDDEN,
         SHARED_HIDDEN=_SHARED_HIDDEN,
@@ -606,8 +708,20 @@ def kimi_k3_fhmoe_bf16(
         TOPK=_TOPK,
         SHARED_EXPERTS=_SHARED_EXPERTS,
         ROUTED_BLOCKS=routed_blocks,
+        ROUTE_SPLITS=stage2_route_splits,
         BLOCK_N=stage2_block_n,
         BLOCK_K=stage2_block_k,
+        num_warps=8,
+    )
+    stage2_reduce_block_n = 256
+    _kimi_k3_fhmoe_stage2_reduce_routes_bf16[
+        (triton.cdiv(_ROUTED_HIDDEN, stage2_reduce_block_n),)
+    ](
+        routed_partials,
+        routed_out,
+        ROUTED_HIDDEN=_ROUTED_HIDDEN,
+        ROUTE_SPLITS=stage2_route_splits,
+        BLOCK_N=stage2_reduce_block_n,
         num_warps=4,
     )
     return routed_out, shared_out

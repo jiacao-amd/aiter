@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Benchmark the original and optimized Kimi-K3 BF16 FHMoE prototypes."""
+"""Benchmark the serial, previous, and current Kimi-K3 BF16 FHMoE paths."""
 
 from __future__ import annotations
 
@@ -168,6 +168,94 @@ def _serial_operation(inputs, workspaces):
     return operation
 
 
+def _previous_optimized_operation(inputs, outputs, workspace):
+    (
+        routed_x,
+        shared_x,
+        routed_w1,
+        routed_w2,
+        shared_w1,
+        shared_w2,
+        topk_ids,
+        topk_weights,
+    ) = inputs
+    routed_out, shared_out = outputs
+    stage1_partials, routed_intermediate, shared_intermediate = kimi._workspace_views(
+        workspace, routed_x.device
+    )
+
+    def operation():
+        stage1_block_n = 16
+        stage1_block_k = 128
+        kimi._kimi_k3_fhmoe_stage1_split_projection_bf16[
+            (
+                TOPK + SHARED_EXPERTS,
+                2 * kimi._STAGE1_SPLIT_K,
+                triton.cdiv(INTERMEDIATE, stage1_block_n),
+            )
+        ](
+            routed_x,
+            shared_x,
+            routed_w1,
+            shared_w1,
+            topk_ids,
+            stage1_partials,
+            ROUTED_HIDDEN=ROUTED_HIDDEN,
+            SHARED_HIDDEN=SHARED_HIDDEN,
+            INTERMEDIATE=INTERMEDIATE,
+            TOPK=TOPK,
+            SHARED_EXPERTS=SHARED_EXPERTS,
+            SPLIT_K=kimi._STAGE1_SPLIT_K,
+            BLOCK_N=stage1_block_n,
+            BLOCK_K=stage1_block_k,
+            num_warps=4,
+        )
+        kimi._kimi_k3_fhmoe_stage1_split_reduce_bf16[
+            (
+                TOPK + SHARED_EXPERTS,
+                triton.cdiv(INTERMEDIATE, stage1_block_n),
+            )
+        ](
+            stage1_partials,
+            routed_intermediate,
+            shared_intermediate,
+            INTERMEDIATE=INTERMEDIATE,
+            TOPK=TOPK,
+            SPLIT_K=kimi._STAGE1_SPLIT_K,
+            SITU_BETA=4.0,
+            SITU_LINEAR_BETA=25.0,
+            BLOCK_N=stage1_block_n,
+            num_warps=1,
+        )
+
+        stage2_block_n = 16
+        stage2_block_k = 128
+        routed_blocks = triton.cdiv(ROUTED_HIDDEN, stage2_block_n)
+        kimi._kimi_k3_fhmoe_stage2_bf16[
+            (routed_blocks + triton.cdiv(SHARED_HIDDEN, stage2_block_n),)
+        ](
+            routed_intermediate,
+            shared_intermediate,
+            routed_w2,
+            shared_w2,
+            topk_ids,
+            topk_weights,
+            routed_out,
+            shared_out,
+            ROUTED_HIDDEN=ROUTED_HIDDEN,
+            SHARED_HIDDEN=SHARED_HIDDEN,
+            INTERMEDIATE=INTERMEDIATE,
+            TOPK=TOPK,
+            SHARED_EXPERTS=SHARED_EXPERTS,
+            ROUTED_BLOCKS=routed_blocks,
+            BLOCK_N=stage2_block_n,
+            BLOCK_K=stage2_block_k,
+            num_warps=4,
+        )
+
+    return operation
+
+
 def _optimized_operation(inputs, outputs, workspace):
     routed_out, shared_out = outputs
 
@@ -186,6 +274,27 @@ def _relative_rmse(actual: torch.Tensor, expected: torch.Tensor) -> float:
     error = (actual.float() - expected.float()).square().mean().sqrt()
     scale = expected.float().square().mean().sqrt().clamp_min(1.0e-12)
     return float(error / scale)
+
+
+def _output_buffers(count: int):
+    return [
+        (
+            torch.empty((1, ROUTED_HIDDEN), dtype=torch.bfloat16, device="cuda"),
+            torch.empty((1, SHARED_HIDDEN), dtype=torch.bfloat16, device="cuda"),
+        )
+        for _ in range(count)
+    ]
+
+
+def _workspaces(count: int):
+    return [
+        torch.empty(
+            kimi.kimi_k3_fhmoe_bf16_workspace_size(),
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        for _ in range(count)
+    ]
 
 
 def main() -> None:
@@ -224,25 +333,23 @@ def main() -> None:
         )
         for _ in cases
     ]
-    optimized_outputs = [
-        (
-            torch.empty((1, ROUTED_HIDDEN), dtype=torch.bfloat16, device="cuda"),
-            torch.empty((1, SHARED_HIDDEN), dtype=torch.bfloat16, device="cuda"),
-        )
-        for _ in cases
-    ]
-    optimized_workspaces = [
-        torch.empty(
-            kimi.kimi_k3_fhmoe_bf16_workspace_size(),
-            dtype=torch.uint8,
-            device="cuda",
-        )
-        for _ in cases
-    ]
+    previous_outputs = _output_buffers(len(cases))
+    previous_workspaces = _workspaces(len(cases))
+    optimized_outputs = _output_buffers(len(cases))
+    optimized_workspaces = _workspaces(len(cases))
 
     serial_operations = [
         _serial_operation(inputs, workspaces)
         for inputs, workspaces in zip(cases, serial_workspaces, strict=True)
+    ]
+    previous_operations = [
+        _previous_optimized_operation(inputs, outputs, workspace)
+        for inputs, outputs, workspace in zip(
+            cases,
+            previous_outputs,
+            previous_workspaces,
+            strict=True,
+        )
     ]
     optimized_operations = [
         _optimized_operation(inputs, outputs, workspace)
@@ -255,34 +362,31 @@ def main() -> None:
     ]
 
     serial_operations[0]()
+    previous_operations[0]()
     optimized_operations[0]()
     torch.cuda.synchronize()
-    routed_error = _relative_rmse(
-        optimized_outputs[0][0],
-        serial_workspaces[0][2],
+    previous_errors = (
+        _relative_rmse(previous_outputs[0][0], serial_workspaces[0][2]),
+        _relative_rmse(previous_outputs[0][1], serial_workspaces[0][3]),
     )
-    shared_error = _relative_rmse(
-        optimized_outputs[0][1],
-        serial_workspaces[0][3],
+    optimized_errors = (
+        _relative_rmse(optimized_outputs[0][0], serial_workspaces[0][2]),
+        _relative_rmse(optimized_outputs[0][1], serial_workspaces[0][3]),
     )
-    if max(routed_error, shared_error) >= 0.01:
+    if max(*previous_errors, *optimized_errors) >= 0.01:
         raise AssertionError(
-            f"relative RMSE exceeds 0.01: routed={routed_error}, "
-            f"shared={shared_error}"
+            "relative RMSE exceeds 0.01: "
+            f"previous={previous_errors}, optimized={optimized_errors}"
         )
 
-    serial_us = _measure(
-        _rotating(serial_operations),
-        operations_per_graph=args.operations_per_graph,
-        replays=args.replays,
-        trials=args.trials,
-    )
-    optimized_us = _measure(
-        _rotating(optimized_operations),
-        operations_per_graph=args.operations_per_graph,
-        replays=args.replays,
-        trials=args.trials,
-    )
+    measure_kwargs = {
+        "operations_per_graph": args.operations_per_graph,
+        "replays": args.replays,
+        "trials": args.trials,
+    }
+    serial_us = _measure(_rotating(serial_operations), **measure_kwargs)
+    previous_us = _measure(_rotating(previous_operations), **measure_kwargs)
+    optimized_us = _measure(_rotating(optimized_operations), **measure_kwargs)
     weight_bytes = sum(
         tensor.numel() * tensor.element_size()
         for inputs in cases
@@ -292,10 +396,12 @@ def main() -> None:
     print("shape: Kimi-K3 B1 TP8-local BF16 expert body")
     print(f"rotating weight set: {weight_bytes / 2**20:.1f} MiB")
     print(f"serial prototype: {serial_us:.3f} us")
+    print(f"previous optimized config: {previous_us:.3f} us")
     print(f"optimized public API: {optimized_us:.3f} us")
-    print(f"speedup: {serial_us / optimized_us:.3f}x")
-    print(f"routed RRMSE: {routed_error:.6f}")
-    print(f"shared RRMSE: {shared_error:.6f}")
+    print(f"incremental speedup: {previous_us / optimized_us:.3f}x")
+    print(f"speedup vs serial: {serial_us / optimized_us:.3f}x")
+    print(f"routed RRMSE: {optimized_errors[0]:.6f}")
+    print(f"shared RRMSE: {optimized_errors[1]:.6f}")
 
 
 if __name__ == "__main__":
