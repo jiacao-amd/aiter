@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Kimi-K3 TP8/B1 heterogeneous MoE prototype.
+"""Kimi-K3 TP8/B1 heterogeneous MoE helpers.
 
 This intentionally narrow prototype validates the part of Kimi-K3 that cannot
 be represented by the existing DeepSeek-V4 FHMoE ABI:
@@ -13,6 +13,10 @@ be represented by the existing DeepSeek-V4 FHMoE ABI:
 The production Kimi checkpoint uses packed MXFP4 weights.  This prototype uses
 BF16 weights so the dual-input/dual-output scheduling contract can be validated
 independently before adding packed-weight loading and tuned kernels.
+
+The shared-expert-only entry point is also used by the production MXFP4
+adapter: the routed branch stays on AITER's native MXFP4 MoE kernel while this
+kernel computes Kimi's unquantized BF16 shared branch on an auxiliary stream.
 """
 
 from __future__ import annotations
@@ -29,6 +33,10 @@ _INTERMEDIATE_PER_TP_RANK = 384
 _TOPK = 16
 _SHARED_EXPERTS = 2
 _SHARED_INTERMEDIATE_PER_TP_RANK = _SHARED_EXPERTS * _INTERMEDIATE_PER_TP_RANK
+_MAX_SHARED_BATCH = 4
+_FUSED_INPUT_PROJECTION = (
+    _ROUTED_HIDDEN + 2 * _SHARED_INTERMEDIATE_PER_TP_RANK
+)
 _SITU_BETA = 4.0
 _SITU_LINEAR_BETA = 25.0
 # 3584 / 14 = 256 and 7168 / 14 = 512.  This gives the B1 GEMV enough
@@ -52,6 +60,20 @@ _ROUTED_INTERMEDIATE_BYTES = _ROUTED_INTERMEDIATE_ELEMENTS * 2
 _SHARED_INTERMEDIATE_BYTES = _SHARED_INTERMEDIATE_ELEMENTS * 2
 _WORKSPACE_BYTES = (
     _STAGE1_PARTIAL_BYTES + _ROUTED_INTERMEDIATE_BYTES + _SHARED_INTERMEDIATE_BYTES
+)
+_SHARED_STAGE1_PARTIAL_SHAPE = (
+    2,
+    _STAGE1_SPLIT_K,
+    _SHARED_INTERMEDIATE_PER_TP_RANK,
+)
+_SHARED_STAGE1_PARTIAL_ELEMENTS = (
+    2 * _STAGE1_SPLIT_K * _SHARED_INTERMEDIATE_PER_TP_RANK
+)
+_SHARED_STAGE1_PARTIAL_BYTES_PER_TOKEN = _SHARED_STAGE1_PARTIAL_ELEMENTS * 4
+_SHARED_INTERMEDIATE_BYTES_PER_TOKEN = _SHARED_INTERMEDIATE_PER_TP_RANK * 2
+_SHARED_WORKSPACE_BYTES_PER_TOKEN = (
+    _SHARED_STAGE1_PARTIAL_BYTES_PER_TOKEN
+    + _SHARED_INTERMEDIATE_BYTES_PER_TOKEN
 )
 
 
@@ -462,6 +484,262 @@ def _kimi_k3_fhmoe_stage2_reduce_routes_bf16(
     tl.store(routed_output + offsets_n, accumulator)
 
 
+@triton.jit
+def _kimi_k3_shared_stage1_split_projection_bf16(
+    shared_x,
+    shared_w1,
+    partials,
+    SHARED_HIDDEN: tl.constexpr,
+    SHARED_INTERMEDIATE: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    token = tl.program_id(0)
+    projection_split = tl.program_id(1)
+    block_n = tl.program_id(2)
+    projection = projection_split // SPLIT_K
+    split = projection_split % SPLIT_K
+    offsets_n = block_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    split_size = SHARED_HIDDEN // SPLIT_K
+    accumulator = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for local_k in range(0, split_size, BLOCK_K):
+        offsets_k = split * split_size + local_k + tl.arange(0, BLOCK_K)
+        weight = tl.load(
+            shared_w1
+            + (projection * SHARED_INTERMEDIATE + offsets_n[:, None])
+            * SHARED_HIDDEN
+            + offsets_k[None, :],
+            cache_modifier=".cg",
+        ).to(tl.float32)
+        x = tl.load(shared_x + token * SHARED_HIDDEN + offsets_k).to(tl.float32)
+        accumulator += tl.sum(weight * x[None, :], axis=1)
+
+    partial_offset = (
+        (token * 2 + projection) * SPLIT_K + split
+    ) * SHARED_INTERMEDIATE + offsets_n
+    tl.store(partials + partial_offset, accumulator)
+
+
+@triton.jit
+def _kimi_k3_shared_stage1_split_projection_m4_bf16(
+    shared_x,
+    shared_w1,
+    partials,
+    SHARED_HIDDEN: tl.constexpr,
+    SHARED_INTERMEDIATE: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """M=4 specialization using MFMA while reusing each weight tile."""
+
+    projection_split = tl.program_id(0)
+    block_n = tl.program_id(1)
+    projection = projection_split // SPLIT_K
+    split = projection_split % SPLIT_K
+    offsets_m = tl.arange(0, 16)
+    offsets_n = block_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    split_size = SHARED_HIDDEN // SPLIT_K
+    accumulator = tl.zeros((16, BLOCK_N), dtype=tl.float32)
+
+    for local_k in range(0, split_size, BLOCK_K):
+        offsets_k = split * split_size + local_k + tl.arange(0, BLOCK_K)
+        x = tl.load(
+            shared_x
+            + offsets_m[:, None] * SHARED_HIDDEN
+            + offsets_k[None, :],
+            mask=offsets_m[:, None] < 4,
+            other=0.0,
+        )
+        weight = tl.load(
+            shared_w1
+            + (projection * SHARED_INTERMEDIATE + offsets_n[None, :])
+            * SHARED_HIDDEN
+            + offsets_k[:, None],
+            cache_modifier=".cg",
+        )
+        accumulator = tl.dot(x, weight, acc=accumulator)
+
+    partial_offsets = (
+        ((offsets_m[:, None] * 2 + projection) * SPLIT_K + split)
+        * SHARED_INTERMEDIATE
+        + offsets_n[None, :]
+    )
+    tl.store(
+        partials + partial_offsets,
+        accumulator,
+        mask=offsets_m[:, None] < 4,
+    )
+
+
+@triton.jit
+def _kimi_k3_shared_stage1_split_reduce_bf16(
+    partials,
+    shared_intermediate,
+    SHARED_INTERMEDIATE: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    SITU_BETA: tl.constexpr,
+    SITU_LINEAR_BETA: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    token = tl.program_id(0)
+    offsets_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    gate = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    up = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for split in range(SPLIT_K):
+        gate += tl.load(
+            partials
+            + ((token * 2) * SPLIT_K + split) * SHARED_INTERMEDIATE
+            + offsets_n
+        )
+        up += tl.load(
+            partials
+            + ((token * 2 + 1) * SPLIT_K + split) * SHARED_INTERMEDIATE
+            + offsets_n
+        )
+
+    tl.store(
+        shared_intermediate + token * SHARED_INTERMEDIATE + offsets_n,
+        _situ(
+            gate,
+            up,
+            BETA=SITU_BETA,
+            LINEAR_BETA=SITU_LINEAR_BETA,
+        ),
+    )
+
+
+@triton.jit
+def _kimi_k3_shared_stage2_bf16(
+    shared_intermediate,
+    shared_w2,
+    shared_output,
+    SHARED_HIDDEN: tl.constexpr,
+    SHARED_INTERMEDIATE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    token = tl.program_id(0)
+    offsets_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    offsets_i = tl.arange(0, BLOCK_K)
+    accumulator = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for i_start in range(0, SHARED_INTERMEDIATE, BLOCK_K):
+        indices_i = i_start + offsets_i
+        weight = tl.load(
+            shared_w2
+            + offsets_n[:, None] * SHARED_INTERMEDIATE
+            + indices_i[None, :],
+            cache_modifier=".cg",
+        ).to(tl.float32)
+        intermediate = tl.load(
+            shared_intermediate + token * SHARED_INTERMEDIATE + indices_i
+        ).to(tl.float32)
+        accumulator += tl.sum(weight * intermediate[None, :], axis=1)
+
+    tl.store(shared_output + token * SHARED_HIDDEN + offsets_n, accumulator)
+
+
+@triton.jit
+def _kimi_k3_shared_stage2_m4_bf16(
+    shared_intermediate,
+    shared_w2,
+    shared_output,
+    SHARED_HIDDEN: tl.constexpr,
+    SHARED_INTERMEDIATE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """M=4 specialization using MFMA while reusing each weight tile."""
+
+    offsets_m = tl.arange(0, 16)
+    offsets_n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    accumulator = tl.zeros((16, BLOCK_N), dtype=tl.float32)
+
+    for i_start in range(0, SHARED_INTERMEDIATE, BLOCK_K):
+        indices_i = i_start + tl.arange(0, BLOCK_K)
+        intermediate = tl.load(
+            shared_intermediate
+            + offsets_m[:, None] * SHARED_INTERMEDIATE
+            + indices_i[None, :],
+            mask=offsets_m[:, None] < 4,
+            other=0.0,
+        )
+        weight = tl.load(
+            shared_w2
+            + offsets_n[None, :] * SHARED_INTERMEDIATE
+            + indices_i[:, None],
+            cache_modifier=".cg",
+        )
+        accumulator = tl.dot(intermediate, weight, acc=accumulator)
+
+    tl.store(
+        shared_output
+        + offsets_m[:, None] * SHARED_HIDDEN
+        + offsets_n[None, :],
+        accumulator,
+        mask=offsets_m[:, None] < 4,
+    )
+
+
+@triton.jit
+def _kimi_k3_split_routed_situ_bf16(
+    fused_projection,
+    routed_output,
+    shared_intermediate,
+    num_tokens,
+    ROUTED_HIDDEN: tl.constexpr,
+    SHARED_INTERMEDIATE: tl.constexpr,
+    FUSED_OUTPUT: tl.constexpr,
+    SITU_BETA: tl.constexpr,
+    SITU_LINEAR_BETA: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Split a fused input projection and apply SiTU to the shared half."""
+
+    token = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    token_valid = token < num_tokens
+
+    routed_mask = token_valid & (offsets < ROUTED_HIDDEN)
+    routed = tl.load(
+        fused_projection + token * FUSED_OUTPUT + offsets,
+        mask=routed_mask,
+        other=0.0,
+    )
+    tl.store(
+        routed_output + token * ROUTED_HIDDEN + offsets,
+        routed,
+        mask=routed_mask,
+    )
+
+    shared_mask = token_valid & (offsets < SHARED_INTERMEDIATE)
+    shared_base = token * FUSED_OUTPUT + ROUTED_HIDDEN
+    gate = tl.load(
+        fused_projection + shared_base + offsets,
+        mask=shared_mask,
+        other=0.0,
+    ).to(tl.float32)
+    up = tl.load(
+        fused_projection + shared_base + SHARED_INTERMEDIATE + offsets,
+        mask=shared_mask,
+        other=0.0,
+    ).to(tl.float32)
+    tl.store(
+        shared_intermediate + token * SHARED_INTERMEDIATE + offsets,
+        _situ(
+            gate,
+            up,
+            BETA=SITU_BETA,
+            LINEAR_BETA=SITU_LINEAR_BETA,
+        ),
+        mask=shared_mask,
+    )
+
+
 def _is_gfx950() -> bool:
     try:
         return get_gfx_runtime() == "gfx950"
@@ -519,6 +797,335 @@ def supports_kimi_k3_fhmoe_bf16(
         and tuple(topk_weights.shape) == (1, _TOPK)
         and expert_count >= _TOPK
     )
+
+
+def supports_kimi_k3_shared_expert_bf16(
+    shared_x: torch.Tensor,
+    shared_w1: torch.Tensor,
+    shared_w2: torch.Tensor,
+) -> bool:
+    """Return whether tensors satisfy Kimi-K3's TP8 small-batch shared MLP."""
+
+    tensors = (shared_x, shared_w1, shared_w2)
+    batch_size = shared_x.shape[0] if shared_x.ndim == 2 else 0
+    return (
+        torch.cuda.is_available()
+        and _is_gfx950()
+        and all(tensor.is_cuda for tensor in tensors)
+        and len({tensor.device for tensor in tensors}) == 1
+        and all(tensor.is_contiguous() for tensor in tensors)
+        and all(tensor.dtype == torch.bfloat16 for tensor in tensors)
+        and 1 <= batch_size <= _MAX_SHARED_BATCH
+        and tuple(shared_x.shape) == (batch_size, _SHARED_HIDDEN)
+        and tuple(shared_w1.shape)
+        == (2 * _SHARED_INTERMEDIATE_PER_TP_RANK, _SHARED_HIDDEN)
+        and tuple(shared_w2.shape)
+        == (_SHARED_HIDDEN, _SHARED_INTERMEDIATE_PER_TP_RANK)
+    )
+
+
+def kimi_k3_shared_expert_bf16_workspace_size(num_tokens: int = 1) -> int:
+    """Return scratch bytes required by ``kimi_k3_shared_expert_bf16``."""
+
+    if not 1 <= num_tokens <= _MAX_SHARED_BATCH:
+        raise ValueError(
+            f"num_tokens must be in [1, {_MAX_SHARED_BATCH}], got {num_tokens}"
+        )
+    return num_tokens * _SHARED_WORKSPACE_BYTES_PER_TOKEN
+
+
+def kimi_k3_split_routed_situ_bf16(
+    fused_projection: torch.Tensor,
+    *,
+    routed_out: torch.Tensor | None = None,
+    shared_intermediate_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split ``[routed, shared_gate, shared_up]`` and apply Kimi SiTU.
+
+    This is the epilogue for a single BF16 input projection formed by stacking
+    Kimi-K3's routed down-projection and shared gate/up projection weights.
+    """
+
+    num_tokens = fused_projection.shape[0] if fused_projection.ndim == 2 else 0
+    if (
+        not torch.cuda.is_available()
+        or not _is_gfx950()
+        or not fused_projection.is_cuda
+        or fused_projection.dtype != torch.bfloat16
+        or not fused_projection.is_contiguous()
+        or not 1 <= num_tokens <= _MAX_SHARED_BATCH
+        or tuple(fused_projection.shape)
+        != (num_tokens, _FUSED_INPUT_PROJECTION)
+    ):
+        raise NotImplementedError(
+            "kimi_k3_split_routed_situ_bf16 requires a contiguous gfx950 "
+            "BF16 tensor with shape [M, 5120] and M in [1, 4]"
+        )
+
+    if routed_out is None:
+        routed_out = torch.empty(
+            (num_tokens, _ROUTED_HIDDEN),
+            dtype=torch.bfloat16,
+            device=fused_projection.device,
+        )
+    elif (
+        routed_out.device != fused_projection.device
+        or routed_out.dtype != torch.bfloat16
+        or not routed_out.is_contiguous()
+        or tuple(routed_out.shape) != (num_tokens, _ROUTED_HIDDEN)
+    ):
+        raise ValueError(
+            "routed_out must be contiguous BF16 shape [M, 3584] on the "
+            "input device"
+        )
+
+    if shared_intermediate_out is None:
+        shared_intermediate_out = torch.empty(
+            (num_tokens, _SHARED_INTERMEDIATE_PER_TP_RANK),
+            dtype=torch.bfloat16,
+            device=fused_projection.device,
+        )
+    elif (
+        shared_intermediate_out.device != fused_projection.device
+        or shared_intermediate_out.dtype != torch.bfloat16
+        or not shared_intermediate_out.is_contiguous()
+        or tuple(shared_intermediate_out.shape)
+        != (num_tokens, _SHARED_INTERMEDIATE_PER_TP_RANK)
+    ):
+        raise ValueError(
+            "shared_intermediate_out must be contiguous BF16 shape [M, 768] "
+            "on the input device"
+        )
+
+    return launch_kimi_k3_split_routed_situ_bf16(
+        fused_projection,
+        routed_out,
+        shared_intermediate_out,
+    )
+
+
+def launch_kimi_k3_split_routed_situ_bf16(
+    fused_projection: torch.Tensor,
+    routed_out: torch.Tensor,
+    shared_intermediate_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Launch the prevalidated fused-input epilogue.
+
+    Callers must satisfy the tensor contract checked by
+    ``kimi_k3_split_routed_situ_bf16``. This low-overhead entry point is for
+    serving integrations that validate and cache the fixed Kimi-K3 contract
+    once per layer.
+    """
+
+    num_tokens = fused_projection.shape[0]
+    block_size = 256
+    _kimi_k3_split_routed_situ_bf16[
+        (
+            num_tokens,
+            triton.cdiv(_ROUTED_HIDDEN, block_size),
+        )
+    ](
+        fused_projection,
+        routed_out,
+        shared_intermediate_out,
+        num_tokens,
+        ROUTED_HIDDEN=_ROUTED_HIDDEN,
+        SHARED_INTERMEDIATE=_SHARED_INTERMEDIATE_PER_TP_RANK,
+        FUSED_OUTPUT=_FUSED_INPUT_PROJECTION,
+        SITU_BETA=_SITU_BETA,
+        SITU_LINEAR_BETA=_SITU_LINEAR_BETA,
+        BLOCK_SIZE=block_size,
+        num_warps=4,
+    )
+    return routed_out, shared_intermediate_out
+
+
+def _shared_workspace_views(
+    workspace: torch.Tensor | None,
+    device: torch.device,
+    num_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    workspace_bytes = kimi_k3_shared_expert_bf16_workspace_size(num_tokens)
+    if workspace is None:
+        workspace = torch.empty(
+            workspace_bytes,
+            dtype=torch.uint8,
+            device=device,
+        )
+    elif (
+        workspace.device != device
+        or workspace.dtype != torch.uint8
+        or not workspace.is_contiguous()
+        or workspace.numel() < workspace_bytes
+        or workspace.data_ptr() % 4
+    ):
+        raise ValueError(
+            "workspace must be a contiguous, 4-byte-aligned uint8 tensor with "
+            f"at least {workspace_bytes} elements on the input device"
+        )
+
+    workspace = workspace.view(-1)
+    partial_end = num_tokens * _SHARED_STAGE1_PARTIAL_BYTES_PER_TOKEN
+    shared_end = partial_end + num_tokens * _SHARED_INTERMEDIATE_BYTES_PER_TOKEN
+    stage1_partials = (
+        workspace[:partial_end]
+        .view(torch.float32)
+        .view(num_tokens, *_SHARED_STAGE1_PARTIAL_SHAPE)
+    )
+    shared_intermediate = (
+        workspace[partial_end:shared_end]
+        .view(torch.bfloat16)
+        .view(num_tokens, _SHARED_INTERMEDIATE_PER_TP_RANK)
+    )
+    return stage1_partials, shared_intermediate
+
+
+def kimi_k3_shared_expert_bf16(
+    shared_x: torch.Tensor,
+    shared_w1: torch.Tensor,
+    shared_w2: torch.Tensor,
+    *,
+    shared_out: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run Kimi-K3's TP8 BF16 shared MLP for one to four tokens.
+
+    The checkpoint stores two shared experts as one MLP with local intermediate
+    width 768: ``7168 -> 2 * 768 -> 768 -> 7168``.
+    """
+
+    if not supports_kimi_k3_shared_expert_bf16(
+        shared_x,
+        shared_w1,
+        shared_w2,
+    ):
+        raise NotImplementedError(
+            "kimi_k3_shared_expert_bf16 requires contiguous gfx950 BF16 "
+            "TP8 tensors with M in [1, 4], hidden=7168, and local "
+            "intermediate=768"
+        )
+
+    device = shared_x.device
+    num_tokens = shared_x.shape[0]
+    if shared_out is None:
+        shared_out = torch.empty_like(shared_x)
+    elif (
+        shared_out.device != device
+        or shared_out.dtype != torch.bfloat16
+        or not shared_out.is_contiguous()
+        or tuple(shared_out.shape) != tuple(shared_x.shape)
+    ):
+        raise ValueError(
+            "shared_out must be a contiguous BF16 tensor matching shared_x "
+            "on the input device"
+        )
+
+    stage1_partials, shared_intermediate = _shared_workspace_views(
+        workspace,
+        device,
+        num_tokens,
+    )
+
+    if num_tokens == _MAX_SHARED_BATCH:
+        stage1_block_n = 16
+        stage1_block_k = 64
+        _kimi_k3_shared_stage1_split_projection_m4_bf16[
+            (
+                2 * _STAGE1_SPLIT_K,
+                triton.cdiv(
+                    _SHARED_INTERMEDIATE_PER_TP_RANK,
+                    stage1_block_n,
+                ),
+            )
+        ](
+            shared_x,
+            shared_w1,
+            stage1_partials,
+            SHARED_HIDDEN=_SHARED_HIDDEN,
+            SHARED_INTERMEDIATE=_SHARED_INTERMEDIATE_PER_TP_RANK,
+            SPLIT_K=_STAGE1_SPLIT_K,
+            BLOCK_N=stage1_block_n,
+            BLOCK_K=stage1_block_k,
+            num_warps=4,
+        )
+    else:
+        stage1_block_n = 16
+        stage1_block_k = 128
+        _kimi_k3_shared_stage1_split_projection_bf16[
+            (
+                num_tokens,
+                2 * _STAGE1_SPLIT_K,
+                triton.cdiv(
+                    _SHARED_INTERMEDIATE_PER_TP_RANK,
+                    stage1_block_n,
+                ),
+            )
+        ](
+            shared_x,
+            shared_w1,
+            stage1_partials,
+            SHARED_HIDDEN=_SHARED_HIDDEN,
+            SHARED_INTERMEDIATE=_SHARED_INTERMEDIATE_PER_TP_RANK,
+            SPLIT_K=_STAGE1_SPLIT_K,
+            BLOCK_N=stage1_block_n,
+            BLOCK_K=stage1_block_k,
+            num_warps=4,
+        )
+
+    stage1_reduce_block_n = 128
+    _kimi_k3_shared_stage1_split_reduce_bf16[
+        (
+            num_tokens,
+            triton.cdiv(
+                _SHARED_INTERMEDIATE_PER_TP_RANK,
+                stage1_reduce_block_n,
+            ),
+        )
+    ](
+        stage1_partials,
+        shared_intermediate,
+        SHARED_INTERMEDIATE=_SHARED_INTERMEDIATE_PER_TP_RANK,
+        SPLIT_K=_STAGE1_SPLIT_K,
+        SITU_BETA=_SITU_BETA,
+        SITU_LINEAR_BETA=_SITU_LINEAR_BETA,
+        BLOCK_N=stage1_reduce_block_n,
+        num_warps=2,
+    )
+
+    if num_tokens == _MAX_SHARED_BATCH:
+        stage2_block_n = 32
+        stage2_block_k = 64
+        _kimi_k3_shared_stage2_m4_bf16[
+            (triton.cdiv(_SHARED_HIDDEN, stage2_block_n),)
+        ](
+            shared_intermediate,
+            shared_w2,
+            shared_out,
+            SHARED_HIDDEN=_SHARED_HIDDEN,
+            SHARED_INTERMEDIATE=_SHARED_INTERMEDIATE_PER_TP_RANK,
+            BLOCK_N=stage2_block_n,
+            BLOCK_K=stage2_block_k,
+            num_warps=4,
+        )
+    else:
+        stage2_block_n = 32
+        stage2_block_k = 128
+        _kimi_k3_shared_stage2_bf16[
+            (
+                num_tokens,
+                triton.cdiv(_SHARED_HIDDEN, stage2_block_n),
+            )
+        ](
+            shared_intermediate,
+            shared_w2,
+            shared_out,
+            SHARED_HIDDEN=_SHARED_HIDDEN,
+            SHARED_INTERMEDIATE=_SHARED_INTERMEDIATE_PER_TP_RANK,
+            BLOCK_N=stage2_block_n,
+            BLOCK_K=stage2_block_k,
+            num_warps=8,
+        )
+    return shared_out
 
 
 def kimi_k3_fhmoe_bf16_workspace_size() -> int:

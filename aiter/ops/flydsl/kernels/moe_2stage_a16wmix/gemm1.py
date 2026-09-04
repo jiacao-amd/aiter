@@ -276,7 +276,9 @@ def _gemm1_body_a16w4(
     if const_expr(not _PIPE):
         a_loader.store_tile(k_base, slot=0)
         b0 = load_b_tile(k_base)
-        rocdl.s_waitcnt(lgkmcnt=0)
+        # Raw CDNA waitcnt encoding for vmcnt=max, expcnt=max, lgkmcnt=0.
+        # This is equivalent to ``s_waitcnt(lgkmcnt=0)`` in newer FlyDSL.
+        rocdl.s_waitcnt(0xC07F)
         gpu.barrier()
         compute_tile(b0, preload_a(0))
         gpu.barrier()
@@ -286,7 +288,7 @@ def _gemm1_body_a16w4(
         for kt in range_constexpr(K_TILES_TOTAL):
             cur_slot = kt % A_LDS_STAGES
             # Wait only THIS tile's A DMA (lgkmcnt); B's vmem stays in flight.
-            rocdl.s_waitcnt(lgkmcnt=0)
+            rocdl.s_waitcnt(0xC07F)
             gpu.barrier()  # single barrier: A(kt) visible before ds_read
             # Phase-separated: read resident A-LDS, THEN issue kt+1's A-DMA + B/B-scale
             # so they overlap the MFMA cluster.

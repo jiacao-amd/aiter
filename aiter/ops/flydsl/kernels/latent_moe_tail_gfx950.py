@@ -13,7 +13,14 @@ from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.typing import ReductionOp, T
 
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+try:
+    # Newer AITER releases vendor these helpers because recent FlyDSL wheels
+    # no longer ship them.
+    from aiter.ops.flydsl.kernels import buffer_ops, vector
+except ImportError:
+    # vLLM nightly currently carries FlyDSL 0.2.x, where the same helpers
+    # still live in flydsl.expr.
+    from flydsl.expr import buffer_ops, vector
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,

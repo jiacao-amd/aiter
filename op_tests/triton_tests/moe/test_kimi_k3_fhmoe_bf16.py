@@ -5,11 +5,14 @@ import pytest
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.flydsl.latent_moe_tail import latent_moe_tail
 from aiter.ops.triton.moe.kimi_k3_fhmoe_bf16 import (
     kimi_k3_fhmoe_bf16,
     kimi_k3_fhmoe_bf16_workspace_size,
+    kimi_k3_shared_expert_bf16,
+    kimi_k3_shared_expert_bf16_workspace_size,
+    kimi_k3_split_routed_situ_bf16,
     supports_kimi_k3_fhmoe_bf16,
+    supports_kimi_k3_shared_expert_bf16,
 )
 
 ROUTED_HIDDEN = 3584
@@ -100,14 +103,38 @@ def _oracle(inputs):
         dim=0, keepdim=True
     )
 
-    shared_gate_up = torch.mv(shared_w1.float(), shared_x[0].float())
+    shared_gate_up = shared_x.float() @ shared_w1.float().T
     shared_gate, shared_up = shared_gate_up.chunk(2, dim=-1)
     shared_intermediate = _situ(shared_gate, shared_up).bfloat16()
-    shared_output = torch.mv(shared_w2.float(), shared_intermediate.float()).unsqueeze(
-        0
-    )
+    shared_output = shared_intermediate.float() @ shared_w2.float().T
 
     return routed_output.bfloat16(), shared_output.bfloat16()
+
+
+def _shared_inputs(batch_size: int, seed: int = 20260903):
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+
+    def randn(shape):
+        return (
+            torch.randn(shape, generator=generator, device="cuda").mul_(0.02).bfloat16()
+        )
+
+    return (
+        randn((batch_size, SHARED_HIDDEN)),
+        randn((2 * SHARED_INTERMEDIATE, SHARED_HIDDEN)),
+        randn((SHARED_HIDDEN, SHARED_INTERMEDIATE)),
+    )
+
+
+def _shared_oracle(
+    shared_x: torch.Tensor,
+    shared_w1: torch.Tensor,
+    shared_w2: torch.Tensor,
+) -> torch.Tensor:
+    gate_up = shared_x.float() @ shared_w1.float().T
+    gate, up = gate_up.chunk(2, dim=-1)
+    intermediate = _situ(gate, up).bfloat16()
+    return (intermediate.float() @ shared_w2.float().T).bfloat16()
 
 
 def _relative_rmse(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -208,6 +235,126 @@ def test_kimi_k3_fhmoe_bf16_workspace_reuse():
         kimi_k3_fhmoe_bf16(*inputs, workspace=workspace[:-1])
 
 
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 4])
+def test_kimi_k3_shared_expert_bf16_matches_oracle(batch_size: int):
+    shared_x, shared_w1, shared_w2 = _shared_inputs(batch_size)
+    assert supports_kimi_k3_shared_expert_bf16(
+        shared_x,
+        shared_w1,
+        shared_w2,
+    )
+
+    workspace = torch.empty(
+        kimi_k3_shared_expert_bf16_workspace_size(batch_size),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    shared_out = torch.empty_like(shared_x)
+    actual = kimi_k3_shared_expert_bf16(
+        shared_x,
+        shared_w1,
+        shared_w2,
+        shared_out=shared_out,
+        workspace=workspace,
+    )
+    expected = _shared_oracle(shared_x, shared_w1, shared_w2)
+    torch.cuda.synchronize()
+
+    assert actual is shared_out
+    assert _relative_rmse(actual, expected) < 0.01
+
+
+def test_kimi_k3_shared_expert_bf16_rejects_large_batch():
+    shared_x, shared_w1, shared_w2 = _shared_inputs(5)
+    assert not supports_kimi_k3_shared_expert_bf16(
+        shared_x,
+        shared_w1,
+        shared_w2,
+    )
+    with pytest.raises(ValueError, match="num_tokens must be"):
+        kimi_k3_shared_expert_bf16_workspace_size(5)
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 4])
+def test_kimi_k3_split_routed_situ_bf16_matches_oracle(batch_size: int):
+    generator = torch.Generator(device="cuda").manual_seed(101 + batch_size)
+    fused_projection = (
+        torch.randn(
+            (batch_size, ROUTED_HIDDEN + 2 * SHARED_INTERMEDIATE),
+            generator=generator,
+            device="cuda",
+        )
+        .mul_(0.02)
+        .bfloat16()
+    )
+    routed_out = torch.empty(
+        (batch_size, ROUTED_HIDDEN),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    shared_intermediate_out = torch.empty(
+        (batch_size, SHARED_INTERMEDIATE),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+
+    actual_routed, actual_shared = kimi_k3_split_routed_situ_bf16(
+        fused_projection,
+        routed_out=routed_out,
+        shared_intermediate_out=shared_intermediate_out,
+    )
+    expected_routed = fused_projection[:, :ROUTED_HIDDEN]
+    gate, up = fused_projection[:, ROUTED_HIDDEN:].chunk(2, dim=-1)
+    expected_shared = _situ(gate.float(), up.float()).bfloat16()
+    torch.cuda.synchronize()
+
+    assert actual_routed is routed_out
+    assert actual_shared is shared_intermediate_out
+    torch.testing.assert_close(actual_routed, expected_routed, rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual_shared,
+        expected_shared,
+        rtol=0.01,
+        atol=0.015625,
+    )
+
+
+def test_kimi_k3_shared_expert_bf16_graph_replay_m4():
+    shared_x, shared_w1, shared_w2 = _shared_inputs(4)
+    workspace = torch.empty(
+        kimi_k3_shared_expert_bf16_workspace_size(4),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    shared_out = torch.empty_like(shared_x)
+
+    kimi_k3_shared_expert_bf16(
+        shared_x,
+        shared_w1,
+        shared_w2,
+        shared_out=shared_out,
+        workspace=workspace,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        kimi_k3_shared_expert_bf16(
+            shared_x,
+            shared_w1,
+            shared_w2,
+            shared_out=shared_out,
+            workspace=workspace,
+        )
+
+    shared_x.add_(0.01)
+    expected = _shared_oracle(shared_x, shared_w1, shared_w2)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert _relative_rmse(shared_out, expected) < 0.01
+
+
 def test_kimi_k3_fhmoe_bf16_graph_replay_uses_updated_inputs():
     inputs = _inputs()
     routed_out = torch.empty_like(inputs[0])
@@ -246,6 +393,8 @@ def test_kimi_k3_fhmoe_bf16_graph_replay_uses_updated_inputs():
 
 
 def test_kimi_k3_fhmoe_bf16_composes_with_latent_tail():
+    from aiter.ops.flydsl.latent_moe_tail import latent_moe_tail
+
     inputs = _inputs()
     generator = torch.Generator(device="cuda").manual_seed(29)
     rms_weight = torch.randn(
