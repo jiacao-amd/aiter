@@ -47,12 +47,14 @@ from flydsl.expr.typing import T
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels.act import situ_params
 from aiter.ops.flydsl.kernels.kernels_common import default_f8_type
 from aiter.ops.flydsl.moe_common import GateMode
 
 from .layout_utils import crd2idx, idx2crd
 from .layout_utils import get as layout_get
 from .mfma_epilogues import c_shuffle_epilog, default_epilog
+from .moe_2stage_a16wmix.gemm1 import _gemm1_body_a16w4
 from .mfma_preshuffle_pipeline import (
     _buffer_load_vec,
     buffer_copy_gmem16_dwordx4,
@@ -149,21 +151,50 @@ def compile_mixed_moe_gemm1_common(
     b_nt: int = 0,
     gate_mode: GateMode = GateMode.SEPARATED,
     a_scale_one: bool = False,
+    a_source_bf16: bool = False,
+    bf16_load_ahead: bool = False,
+    mask_padded_a: bool = False,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
+    block_waves: int | None = None,
     shared_expert_id: int | None = None,
     v2_output_layout: bool = False,
+    sort_block_m: int = 0,
+    kimi_shared_bf16: bool = False,
+    kimi_shared_weight_layout: str = "preshuffled",
+    kimi_shared_b_cache_mod: int | None = None,
+    kimi_shared_wave_local_wait: bool = False,
+    kimi_shared_pipeline_wait: str = "default",
+    kimi_shared_start_sleep: int = 0,
+    kimi_routed_late_a1: bool = False,
+    kimi_routed_a_ring2: bool = False,
+    kimi_routed_b_ring4: bool = False,
+    kimi_routed_b_early4: bool = False,
+    kimi_routed_b_half_carry: bool = False,
+    kimi_routed_priority3: bool = False,
+    kimi_shared_wg_schedule: str = "prefix",
+    kimi_shared_grid_split_k: int = 1,
+    kimi_shared_grid_tile_n: int = 32,
+    kimi_shared_grid_n_major: bool = False,
+    kimi_shared_fused_reduce: bool = False,
+    kimi_shared_identity_m_indices: bool = False,
+    kimi_shared_a_lds_swizzle: bool = False,
+    kimi_shared_vec2_partials: bool = False,
 ):
     """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
-    heterogeneous_b = shared_expert_id is not None
-    if heterogeneous_b and shared_expert_id != experts - 1:
+    heterogeneous_b = shared_expert_id is not None or kimi_shared_bf16
+    if shared_expert_id is not None and shared_expert_id != experts - 1:
         raise ValueError(
             "FHMoE stage1 requires shared_expert_id == experts - 1; "
             f"got {shared_expert_id=} and {experts=}"
         )
     gpu_arch = get_hip_arch()
     allocator_pong = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem0")
-    allocator_ping = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem1")
+    allocator_ping = (
+        allocator_pong
+        if kimi_shared_bf16
+        else SmemAllocator(None, arch=gpu_arch, global_sym_name="smem1")
+    )
 
     if a_dtype not in ("fp8", "fp4"):
         raise ValueError(f"a_dtype must be one of ('fp8','fp4'), got {a_dtype!r}")
@@ -175,17 +206,271 @@ def compile_mixed_moe_gemm1_common(
     is_f8_b = b_dtype == "fp8"
     if heterogeneous_b and not is_f4_b:
         raise ValueError("Heterogeneous B requires MXFP4 routed weights")
+    if a_source_bf16 and (not is_f8_a or not a_scale_one):
+        raise ValueError(
+            "a_source_bf16 requires a_dtype='fp8' and a_scale_one=True"
+        )
+    if bf16_load_ahead and not a_source_bf16:
+        raise ValueError("bf16_load_ahead requires a_source_bf16=True")
+    if mask_padded_a and not is_f8_a:
+        raise ValueError("mask_padded_a requires an FP8 compute input")
+    valid_shared_wg_schedules = (
+        "prefix",
+        "suffix",
+        "centered",
+        "interleave2",
+        "interleave4",
+        "interleave8",
+    )
+    if kimi_shared_wg_schedule not in valid_shared_wg_schedules:
+        raise ValueError(
+            "kimi_shared_wg_schedule must be one of "
+            f"{valid_shared_wg_schedules}, "
+            f"got {kimi_shared_wg_schedule!r}"
+        )
+    shared_wg_interleave = {
+        "interleave2": 2,
+        "interleave4": 4,
+        "interleave8": 8,
+    }.get(kimi_shared_wg_schedule, 0)
+    if kimi_shared_wg_schedule != "prefix" and not kimi_shared_bf16:
+        raise ValueError(
+            "non-prefix kimi_shared_wg_schedule requires kimi_shared_bf16=True"
+        )
+    default_num_n_waves = min(4, tile_n // 32)
+    if block_waves is None:
+        num_n_waves = default_num_n_waves
+        num_waves_total = num_n_waves * k_wave
+    else:
+        num_waves_total = int(block_waves)
+        if num_waves_total not in (4, 8):
+            raise ValueError(
+                f"block_waves must be 4 or 8, got {num_waves_total}"
+            )
+        if num_waves_total % k_wave:
+            raise ValueError(
+                f"block_waves={num_waves_total} must be divisible by "
+                f"k_wave={k_wave}"
+            )
+        num_n_waves = num_waves_total // k_wave
+    if num_n_waves < 1 or tile_n % num_n_waves:
+        raise ValueError(
+            f"tile_n={tile_n} must divide across {num_n_waves} N waves"
+        )
+    n_per_wave = tile_n // num_n_waves
+    if n_per_wave < 16 or n_per_wave % 16:
+        raise ValueError(
+            "each N wave must own a positive multiple of 16 columns, got "
+            f"tile_n={tile_n}, block_waves={num_waves_total}, "
+            f"k_wave={k_wave}, n_per_wave={n_per_wave}"
+        )
+    if kimi_shared_grid_split_k < 1:
+        raise ValueError(
+            "kimi_shared_grid_split_k must be positive, got "
+            f"{kimi_shared_grid_split_k}"
+        )
+    kimi_shared_grid_split = kimi_shared_grid_split_k > 1
+    if kimi_shared_grid_n_major and not kimi_shared_grid_split:
+        raise ValueError(
+            "kimi_shared_grid_n_major requires kimi_shared_grid_split_k > 1"
+        )
+    if kimi_shared_grid_tile_n not in (16, 32, 64):
+        raise ValueError(
+            "kimi_shared_grid_tile_n must be 16, 32, or 64, got "
+            f"{kimi_shared_grid_tile_n}"
+        )
+    if kimi_shared_grid_split:
+        kimi_shared_num_n_waves = kimi_shared_grid_tile_n // 16
+        if num_waves_total % kimi_shared_num_n_waves:
+            raise ValueError(
+                f"block_waves={num_waves_total} must divide the shared "
+                f"N-wave count {kimi_shared_num_n_waves}"
+            )
+        kimi_shared_k_wave = num_waves_total // kimi_shared_num_n_waves
+    else:
+        kimi_shared_k_wave = 4 if kimi_shared_weight_layout == "rowmajor" else 2
+    if kimi_shared_k_wave not in (1, 2, 4):
+        raise ValueError(
+            "the shared Stage1 K-wave partition must be 1, 2, or 4; got "
+            f"{kimi_shared_k_wave}"
+        )
+    if kimi_shared_fused_reduce and not (
+        kimi_shared_grid_split
+        and kimi_shared_grid_split_k == 7
+        and kimi_shared_k_wave > 1
+        and kimi_shared_grid_tile_n
+        == 16 * (num_waves_total // kimi_shared_k_wave)
+    ):
+        raise ValueError(
+            "kimi_shared_fused_reduce requires integrated shared Stage1 "
+            "split-K 7 with one 16-column N tile per wave and k_wave > 1"
+        )
+    if kimi_shared_identity_m_indices and not kimi_shared_grid_split:
+        raise ValueError(
+            "kimi_shared_identity_m_indices requires integrated shared "
+            "Stage1 split-K"
+        )
+    if kimi_shared_a_lds_swizzle and not kimi_shared_grid_split:
+        raise ValueError(
+            "kimi_shared_a_lds_swizzle requires integrated shared Stage1 split-K"
+        )
+    if kimi_shared_vec2_partials and not kimi_shared_grid_split:
+        raise ValueError(
+            "kimi_shared_vec2_partials requires integrated shared Stage1 split-K"
+        )
+    if kimi_shared_wave_local_wait and not (
+        kimi_shared_bf16
+        and kimi_shared_weight_layout == "rowmajor"
+        and kimi_shared_k_wave == 4
+    ):
+        raise ValueError(
+            "kimi_shared_wave_local_wait requires kimi_shared_bf16=True "
+            "with kimi_shared_weight_layout='rowmajor' (shared k_wave=4)"
+        )
+    if kimi_shared_pipeline_wait not in (
+        "default",
+        "fenced",
+        "partial",
+        "defer3",
+        "deferup3",
+        "ring4",
+    ):
+        raise ValueError(
+            "kimi_shared_pipeline_wait must be 'default', 'fenced', 'partial', "
+            "'defer3', 'deferup3', or 'ring4', "
+            f"got {kimi_shared_pipeline_wait!r}"
+        )
+    if kimi_shared_pipeline_wait != "default" and not (
+        kimi_shared_bf16 and kimi_shared_weight_layout == "rowmajor"
+    ):
+        raise ValueError(
+            "non-default kimi_shared_pipeline_wait requires kimi_shared_bf16=True "
+            "with kimi_shared_weight_layout='rowmajor'"
+        )
+    if kimi_shared_wave_local_wait and kimi_shared_pipeline_wait != "default":
+        raise ValueError(
+            "kimi_shared_wave_local_wait and non-default "
+            "kimi_shared_pipeline_wait are mutually exclusive"
+        )
+    if kimi_shared_grid_split and (
+        not kimi_shared_bf16
+        or kimi_shared_weight_layout != "rowmajor"
+        or kimi_shared_grid_split_k not in (4, 7, 14)
+        or tile_m != 16
+        or kimi_shared_wave_local_wait
+        or not str(gpu_arch).startswith("gfx950")
+    ):
+        raise ValueError(
+            "grid-split Kimi shared Stage1 requires gfx950, row-major BF16 "
+            "weights, BM16, split-K 4/7/14, and no wave-local wait"
+        )
+    default_shared_b_cache_mod = (
+        1 if kimi_shared_weight_layout == "rowmajor" else 0
+    )
+    resolved_shared_b_cache_mod = (
+        default_shared_b_cache_mod
+        if kimi_shared_b_cache_mod is None
+        else int(kimi_shared_b_cache_mod)
+    )
+    if resolved_shared_b_cache_mod not in (0, 1, 2, 3):
+        raise ValueError(
+            "kimi_shared_b_cache_mod must be 0, 1, 2, or 3, got "
+            f"{resolved_shared_b_cache_mod}"
+        )
+    if kimi_shared_bf16:
+        if kimi_shared_weight_layout not in ("preshuffled", "rowmajor"):
+            raise ValueError(
+                "kimi_shared_weight_layout must be 'preshuffled' or 'rowmajor', "
+                f"got {kimi_shared_weight_layout!r}"
+            )
+        if not (
+            model_dim == 3584
+            and inter_dim == 384
+            and topk == 16
+            and tile_m in (16, 32)
+            and (sort_block_m <= 0 or sort_block_m == 32)
+            and (
+                (tile_n == 128 and num_waves_total == 4)
+                or (
+                    tile_n == 256
+                    and num_waves_total == 8
+                    and not a_source_bf16
+                    and kimi_shared_grid_split
+                    and kimi_shared_grid_tile_n == 64
+                )
+            )
+            and tile_k == 256
+            and persist_m == 1
+            and gate_mode is GateMode.INTERLEAVE
+            and is_f8_a
+            and a_scale_one
+            and out_dtype == "bf16"
+            and k_batch == 1
+            and k_wave == 1
+            and xcd_swizzle in (0, 4)
+            and not enable_bias
+        ):
+            raise ValueError(
+                "kimi_shared_bf16 requires the Kimi-K3 routed Stage1 profile "
+                "(K=3584, N=384, topk=16, BM=16/32, sortBM=32, "
+                "BN128/4-wave or native-FP8 BN256/8-wave, BK=256, "
+                "persist_m=1, interleave, BF16 output, k_wave=1, xcd=0/4)"
+            )
+    if not 0 <= kimi_shared_start_sleep <= 3:
+        raise ValueError(
+            "kimi_shared_start_sleep must be in [0, 3], got "
+            f"{kimi_shared_start_sleep}"
+        )
+    if kimi_shared_start_sleep and not (
+        str(gpu_arch).startswith("gfx950")
+        and kimi_shared_bf16
+        and kimi_shared_weight_layout == "rowmajor"
+        and model_dim == 3584
+        and inter_dim == 384
+        and topk == 16
+        and tile_m == 16
+        and sort_block_m == 32
+        and tile_n == 128
+        and tile_k == 256
+        and persist_m == 1
+        and not doweight_stage1
+        and is_f8_a
+        and is_f4_b
+        and out_dtype == "bf16"
+        and act == "situv2"
+        and gate_mode is GateMode.INTERLEAVE
+        and (not a_source_bf16 or bf16_load_ahead)
+        and a_scale_one
+        and k_batch == 1
+        and k_wave == 1
+        and not use_async_copy
+        and b_nt == 2
+        and xcd_swizzle == 0
+        and not enable_bias
+        and v2_output_layout
+    ):
+        raise ValueError(
+            "kimi_shared_start_sleep requires the exact gfx950 integrated "
+            "Kimi-K3 row-major BF16 shared Stage1 profile with either "
+            "BF16 source/load-ahead or a preconverted FP8 source"
+        )
 
-    sort_block_m = tile_m
-    num_waves = min(4, tile_n // 32)
-    # accumulators are reduced in LDS before the epilogue. k_wave=1 keeps the
-    num_n_waves = num_waves
-    num_waves_total = num_n_waves * k_wave
-    # threads, so the cooperative-load striding is group-local.
-    a_load_threads = num_n_waves * 64
+    # Direct global-to-LDS loads cannot transform the payload.  Convert BF16
+    # sources to packed FP8 in registers, then use the normal LDS store path.
+    if a_source_bf16:
+        use_async_copy = False
+
+    sort_block_m = tile_m if sort_block_m <= 0 else sort_block_m
+    if sort_block_m != tile_m and sort_block_m % tile_m != 0:
+        raise ValueError(
+            f"sort_block_m ({sort_block_m}) must be a multiple of tile_m ({tile_m})"
+        )
+    # In the BN256/8-wave specialization, the first four waves retain the
+    # existing 16-byte activation-copy geometry while all eight waves compute.
+    # This halves duplicate A/metadata traffic when the routed N grid is widened.
+    a_load_threads = min(num_n_waves, 4) * 64
     total_threads = num_waves_total * 64
     pack_M = 1 if tile_m < 32 else 2
-    n_per_wave = tile_n // num_waves
     pack_N = min(2, n_per_wave // 16)
     pack_K = 2
     scale_mn_pack = 2
@@ -272,7 +557,58 @@ def compile_mixed_moe_gemm1_common(
     fp4q_tag = "_fp4q" if need_fp4 else ""
     fp8q_tag = "_fp8q" if need_fp8 else ""
     sort_tag = "_sort" if need_sort else ""
+    sbm_tag = "" if sort_block_m == tile_m else f"_sbm{sort_block_m}"
     async_tag = "_async" if use_async_copy else ""
+    a_source_tag = "_srcbf16" if a_source_bf16 else ""
+    load_ahead_tag = "_xlaht" if bf16_load_ahead else ""
+    routed_late_a1_tag = "_rla1" if kimi_routed_late_a1 else ""
+    routed_a_ring2_tag = "_rar2" if kimi_routed_a_ring2 else ""
+    routed_b_ring4_tag = "_rbr4" if kimi_routed_b_ring4 else ""
+    routed_b_early4_tag = "_rbe4" if kimi_routed_b_early4 else ""
+    routed_b_half_carry_tag = "_rbhc" if kimi_routed_b_half_carry else ""
+    routed_priority3_tag = "_rp3" if kimi_routed_priority3 else ""
+    mask_padded_a_tag = "_mpaoob" if mask_padded_a else ""
+    shared_wave_local_wait_tag = "_swlw" if kimi_shared_wave_local_wait else ""
+    shared_start_sleep_tag = (
+        f"_sss{kimi_shared_start_sleep}" if kimi_shared_start_sleep else ""
+    )
+    shared_pipeline_wait_tag = {
+        "default": "",
+        "fenced": "_spwf",
+        "partial": "_spwp",
+        "defer3": "_spwd3",
+        "deferup3": "_spwdu3",
+        "ring4": "_spwr4",
+    }[kimi_shared_pipeline_wait]
+    shared_wg_schedule_tag = (
+        ""
+        if kimi_shared_wg_schedule == "prefix"
+        else f"_swg{kimi_shared_wg_schedule}"
+    )
+    shared_grid_split_tag = (
+        f"_sgsk{kimi_shared_grid_split_k}"
+        f"_sgtn{kimi_shared_grid_tile_n}"
+        f"_sgkw{kimi_shared_k_wave}"
+        f"{'_sgnm' if kimi_shared_grid_n_major else ''}"
+        if kimi_shared_grid_split
+        else ""
+    )
+    shared_fused_reduce_tag = "_sgfr" if kimi_shared_fused_reduce else ""
+    shared_identity_m_indices_tag = (
+        "_sgimi" if kimi_shared_identity_m_indices else ""
+    )
+    shared_a_lds_swizzle_tag = "_sgasw" if kimi_shared_a_lds_swizzle else ""
+    shared_vec2_partials_tag = "_sgv2p" if kimi_shared_vec2_partials else ""
+    shared_b_cache_mod_tag = (
+        f"_sbcm{resolved_shared_b_cache_mod}"
+        if kimi_shared_bf16
+        and resolved_shared_b_cache_mod != default_shared_b_cache_mod
+        else ""
+    )
+    wpe_tag = f"_wpe{waves_per_eu}" if waves_per_eu is not None else ""
+    block_waves_tag = (
+        f"_bw{num_waves_total}" if block_waves is not None else ""
+    )
     sk_tag = f"_sk{k_batch}" if is_splitk else ""
     kw_tag = f"_kw{k_wave}" if k_wave > 1 else ""
     go_tag = "_go" if mock_gate_only else ""
@@ -284,13 +620,17 @@ def compile_mixed_moe_gemm1_common(
     # they cannot alias. SiTUv2 beta values are runtime kernel arguments and
     # therefore must not be part of the on-disk symbol/cache identity.
     act_tag = "" if act == "silu" else f"_{act}"
-    heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
+    heterogeneous_tag = (
+        f"_kimi_shared_bf16_{kimi_shared_weight_layout}"
+        if kimi_shared_bf16
+        else (f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else "")
+    )
     # ABI v33 adds four runtime SiTUv2 beta scalars; heterogeneous ABI tracks one
     # version ahead of the ordinary kernel.
-    kernel_version = 34 if heterogeneous_b else 33
+    kernel_version = 35 if kimi_shared_grid_split else (34 if heterogeneous_b else 33)
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{sbm_tag}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{a_source_tag}{load_ahead_tag}{routed_late_a1_tag}{routed_a_ring2_tag}{routed_b_ring4_tag}{routed_b_early4_tag}{routed_b_half_carry_tag}{routed_priority3_tag}{mask_padded_a_tag}{shared_wave_local_wait_tag}{shared_pipeline_wait_tag}{shared_start_sleep_tag}{shared_wg_schedule_tag}{shared_grid_split_tag}{shared_fused_reduce_tag}{shared_identity_m_indices_tag}{shared_a_lds_swizzle_tag}{shared_vec2_partials_tag}{shared_b_cache_mod_tag}{wpe_tag}{block_waves_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -316,7 +656,7 @@ def compile_mixed_moe_gemm1_common(
         and lds_limit > 0
         and lds_out_bytes > 0
         and std_total > lds_limit
-        and num_waves >= 2
+        and num_n_waves >= 2
     )
 
     if split_lds_out:
@@ -341,11 +681,25 @@ def compile_mixed_moe_gemm1_common(
     if waves_per_eu is not None and waves_per_eu >= 1:
         total_cu_lds = 160 * 1024
         min_lds = total_cu_lds // (waves_per_eu + 1) + 1
-        pong_sz = allocator_pong._align(allocator_pong.ptr, 128)
-        ping_sz = allocator_ping._align(allocator_ping.ptr, 128)
-        cur_lds = pong_sz + ping_sz
-        if cur_lds < min_lds:
-            allocator_ping.ptr += min_lds - cur_lds
+        if kimi_shared_bf16:
+            cur_lds = allocator_pong._align(allocator_pong.ptr, 128)
+            if cur_lds < min_lds:
+                allocator_pong.ptr += min_lds - cur_lds
+        else:
+            pong_sz = allocator_pong._align(allocator_pong.ptr, 128)
+            ping_sz = allocator_ping._align(allocator_ping.ptr, 128)
+            cur_lds = pong_sz + ping_sz
+            if cur_lds < min_lds:
+                allocator_ping.ptr += min_lds - cur_lds
+    if kimi_shared_bf16:
+        # The paths are runtime-exclusive, so one 32-KiB arena can back either
+        # the routed ping-pong/c-shuffle storage or shared's two-stage A tiles.
+        shared_lds_bytes = (
+            32 * 1024
+            if not kimi_shared_grid_split or kimi_shared_grid_tile_n == 16
+            else 16 * 1024
+        )
+        allocator_pong.ptr = max(allocator_pong.ptr, shared_lds_bytes)
 
     kpack_bytes = 16
     out_elem_bytes = 4 if out_is_f32 else 2
@@ -355,7 +709,9 @@ def compile_mixed_moe_gemm1_common(
     shared_w_nbytes = (2 * inter_dim) * model_dim
     bias_nbytes = experts * (2 * inter_dim) * 4
 
-    e_vec_s1 = min(tile_n // 32, 8)
+    # The Kimi c-shuffle maps one four-element vector per lane.  Widening the
+    # block adds waves instead of widening that per-lane vector.
+    e_vec_s1 = 4 if kimi_shared_bf16 else min(tile_n // 32, 8)
     if need_quant:
         e_vec_s1 = max(2, e_vec_s1)
     num_threads_per_quant_blk_s1 = 32 // e_vec_s1
@@ -402,6 +758,257 @@ def compile_mixed_moe_gemm1_common(
     pipe_mfma_per_phase = max(1, len(pipe_all_mfma) // 4)
     pipe_n_phases = len(pipe_all_mfma) // pipe_mfma_per_phase
 
+    if kimi_routed_late_a1 and kimi_routed_a_ring2:
+        raise ValueError(
+            "kimi_routed_late_a1 and kimi_routed_a_ring2 are mutually exclusive"
+        )
+    routed_b_schedule_count = sum(
+        int(flag)
+        for flag in (
+            kimi_routed_b_ring4,
+            kimi_routed_b_early4,
+            kimi_routed_b_half_carry,
+        )
+    )
+    if routed_b_schedule_count > 1:
+        raise ValueError(
+            "kimi_routed_b_ring4, kimi_routed_b_early4, "
+            "and kimi_routed_b_half_carry are mutually exclusive"
+        )
+    if kimi_routed_late_a1 and not (
+        str(gpu_arch).startswith("gfx950")
+        and kimi_shared_bf16
+        and model_dim == 3584
+        and inter_dim == 384
+        and topk == 16
+        and tile_m == 16
+        and sort_block_m == 32
+        and tile_n == 128
+        and tile_k == 256
+        and persist_m == 1
+        and not doweight_stage1
+        and is_f8_a
+        and is_f4_b
+        and out_is_bf16
+        and act == "situv2"
+        and gate_up_interleave
+        and a_source_bf16
+        and bf16_load_ahead
+        and a_scale_one
+        and k_batch == 1
+        and k_wave == 1
+        and not use_async_copy
+        and b_nt == 2
+        and xcd_swizzle == 0
+        and not enable_bias
+        and v2_output_layout
+        and pipe_k_unroll == 2
+        and pipe_m_repeat == 1
+        and pipe_num_acc_n == 2
+        and pipe_n_phases == 4
+    ):
+        raise ValueError(
+            "kimi_routed_late_a1 requires the exact gfx950 Kimi-K3 unified "
+            "routed Stage1 profile (BF16 source/load-ahead, FP8 x MXFP4, "
+            "BM16/SORT_BM32/BN128/BK256, gate-up interleave)"
+        )
+    if kimi_routed_a_ring2 and not (
+        str(gpu_arch).startswith("gfx950")
+        and kimi_shared_bf16
+        and model_dim == 3584
+        and inter_dim == 384
+        and topk == 16
+        and tile_m == 16
+        and sort_block_m == 32
+        and tile_n == 128
+        and tile_k == 256
+        and persist_m == 1
+        and not doweight_stage1
+        and is_f8_a
+        and is_f4_b
+        and out_is_bf16
+        and act == "situv2"
+        and gate_up_interleave
+        and a_source_bf16
+        and bf16_load_ahead
+        and a_scale_one
+        and k_batch == 1
+        and k_wave == 1
+        and not use_async_copy
+        and b_nt == 2
+        and xcd_swizzle == 0
+        and not enable_bias
+        and v2_output_layout
+        and pipe_k_unroll == 2
+        and pipe_m_repeat == 1
+        and pipe_num_acc_n == 2
+        and pipe_n_phases == 4
+    ):
+        raise ValueError(
+            "kimi_routed_a_ring2 requires the exact gfx950 Kimi-K3 unified "
+            "routed Stage1 profile (BF16 source/load-ahead, FP8 x MXFP4, "
+            "BM16/SORT_BM32/BN128/BK256, gate-up interleave)"
+        )
+    if kimi_routed_b_ring4 and not (
+        str(gpu_arch).startswith("gfx950")
+        and kimi_shared_bf16
+        and model_dim == 3584
+        and inter_dim == 384
+        and topk == 16
+        and tile_m == 16
+        and sort_block_m == 32
+        and tile_n == 128
+        and tile_k == 256
+        and persist_m == 1
+        and not doweight_stage1
+        and is_f8_a
+        and is_f4_b
+        and out_is_bf16
+        and act == "situv2"
+        and gate_up_interleave
+        and (not a_source_bf16 or bf16_load_ahead)
+        and a_scale_one
+        and k_batch == 1
+        and k_wave == 1
+        and not use_async_copy
+        and b_nt == 2
+        and xcd_swizzle == 0
+        and not enable_bias
+        and v2_output_layout
+        and pipe_k_unroll == 2
+        and pipe_m_repeat == 1
+        and pipe_num_acc_n == 2
+        and pipe_n_phases == 4
+        and len(pipe_b_loads) == pipe_n_phases
+    ):
+        raise ValueError(
+            "kimi_routed_b_ring4 requires the exact gfx950 Kimi-K3 unified "
+            "routed Stage1 profile (BF16 source/load-ahead or preconverted "
+            "FP8 source, FP8 x MXFP4, "
+            "BM16/SORT_BM32/BN128/BK256, gate-up interleave)"
+        )
+    if kimi_routed_b_early4 and not (
+        str(gpu_arch).startswith("gfx950")
+        and kimi_shared_bf16
+        and model_dim == 3584
+        and inter_dim == 384
+        and topk == 16
+        and tile_m == 16
+        and sort_block_m == 32
+        and tile_n == 128
+        and tile_k == 256
+        and persist_m == 1
+        and not doweight_stage1
+        and is_f8_a
+        and is_f4_b
+        and out_is_bf16
+        and act == "situv2"
+        and gate_up_interleave
+        and (not a_source_bf16 or bf16_load_ahead)
+        and a_scale_one
+        and k_batch == 1
+        and k_wave == 1
+        and not use_async_copy
+        and b_nt == 2
+        and xcd_swizzle == 0
+        and not enable_bias
+        and v2_output_layout
+        and pipe_k_unroll == 2
+        and pipe_m_repeat == 1
+        and pipe_num_acc_n == 2
+        and pipe_n_phases == 4
+        and len(pipe_b_loads) == 4
+    ):
+        raise ValueError(
+            "kimi_routed_b_early4 requires the exact gfx950 Kimi-K3 unified "
+            "routed Stage1 profile (BF16 source/load-ahead or preconverted "
+            "FP8 source, FP8 x MXFP4, BM16/SORT_BM32/BN128/BK256, "
+            "four-phase/four-slot pipeline)"
+        )
+    if kimi_routed_b_half_carry and not (
+        str(gpu_arch).startswith("gfx950")
+        and kimi_shared_bf16
+        and model_dim == 3584
+        and model_dim_pad == 0
+        and inter_dim == 384
+        and topk == 16
+        and tile_m == 16
+        and sort_block_m == 32
+        and tile_n in (128, 256)
+        and num_waves_total == tile_n // 32
+        and tile_k == 256
+        and persist_m == 1
+        and not doweight_stage1
+        and is_f8_a
+        and is_f4_b
+        and out_is_bf16
+        and act == "situv2"
+        and gate_up_interleave
+        and (not a_source_bf16 or bf16_load_ahead)
+        and a_scale_one
+        and k_batch == 1
+        and k_wave == 1
+        and not use_async_copy
+        and b_nt == 2
+        and xcd_swizzle == 0
+        and not enable_bias
+        and v2_output_layout
+        and pipe_k_unroll == 2
+        and pipe_m_repeat == 1
+        and pipe_num_acc_n == 2
+        and pipe_n_phases == 4
+        and pipe_b_loads == [
+            ("gate", 0, 0),
+            ("gate", 0, 1),
+            ("gate", 1, 0),
+            ("gate", 1, 1),
+        ]
+    ):
+        raise ValueError(
+            "kimi_routed_b_half_carry requires the exact gfx950 Kimi-K3 "
+            "unified routed Stage1 profile (BF16 source/load-ahead or "
+            "preconverted FP8 source, FP8 x MXFP4, "
+            "BM16/SORT_BM32/BN128-256/BK256, four B slots)"
+        )
+    if kimi_routed_priority3 and not (
+        str(gpu_arch).startswith("gfx950")
+        and kimi_shared_bf16
+        and model_dim == 3584
+        and inter_dim == 384
+        and topk == 16
+        and tile_m == 16
+        and sort_block_m == 32
+        and tile_n in (128, 256)
+        and num_waves_total == tile_n // 32
+        and tile_k == 256
+        and persist_m == 1
+        and not doweight_stage1
+        and is_f8_a
+        and is_f4_b
+        and out_is_bf16
+        and act == "situv2"
+        and gate_up_interleave
+        and (not a_source_bf16 or bf16_load_ahead)
+        and a_scale_one
+        and k_batch == 1
+        and k_wave == 1
+        and not use_async_copy
+        and b_nt == 2
+        and xcd_swizzle == 0
+        and not enable_bias
+        and v2_output_layout
+        and pipe_k_unroll == 2
+        and pipe_m_repeat == 1
+        and pipe_num_acc_n == 2
+        and pipe_n_phases == 4
+    ):
+        raise ValueError(
+            "kimi_routed_priority3 requires the exact gfx950 Kimi-K3 unified "
+            "routed Stage1 profile (BF16 source/load-ahead or preconverted "
+            "FP8 source, FP8 x MXFP4, "
+            "BM16/SORT_BM32/BN128/BK256, gate-up interleave)"
+        )
+
     a_groups_per_phase = (len(pipe_a_groups) + pipe_n_phases - 1) // pipe_n_phases
     pipe_phases = []
     mfma_i = 0
@@ -435,6 +1042,9 @@ def compile_mixed_moe_gemm1_common(
     pp_a_reads = [p["a_reads"] for p in pipe_phases]
     pp_b_loads = [p["b_loads"] for p in pipe_phases]
     pp_has_scale = [p["has_scale"] for p in pipe_phases]
+    pipe_b_early4_slots = ((0, 1), (2,), (3,), ())
+    pipe_b_half_seed_slots = (0, 1)
+    pipe_b_half_fill_slots = (2, 3)
 
     fp4_ratio = 2 if a_dtype == "fp4" else 1
     gui_ratio = 1 if gate_up_interleave else 2
@@ -485,6 +1095,9 @@ def compile_mixed_moe_gemm1_common(
             vec4_f32 = T.vec(4, f32)
             vec16_elems = 16 if a_elem_bytes == 1 else 8
             vec16_x = T.vec(vec16_elems, x_elem)
+            vec8_x = T.vec(8, x_elem)
+            vec2_i32 = T.vec(2, i32)
+            vec4_i32 = T.vec(4, i32)
             vec2_i64 = T.vec(2, i64)
 
             def ptr_buffer_resource(ptr, num_records_bytes):
@@ -537,6 +1150,222 @@ def compile_mixed_moe_gemm1_common(
             by = gpu.block_id("x")
             bx_persist = gpu.block_id("y")
 
+            base_ptr_pong = allocator_pong.get_base()
+            base_ptr_ping = allocator_ping.get_base()
+
+            if const_expr(kimi_shared_bf16):
+                # The routed grid has six N tiles. Reserve enough grid-y rows
+                # for all shared workgroups while keeping both paths in one
+                # launch. Grid-split mode combines gate/up in each workgroup;
+                # its linear id covers [split-K, shared-N-tile].
+                shared_grid_x = (2 * inter_dim) // tile_n
+                shared_tile_n = (
+                    kimi_shared_grid_tile_n
+                    if kimi_shared_grid_split
+                    else (16 if kimi_shared_weight_layout == "rowmajor" else 32)
+                )
+                shared_tile_k = (
+                    128 if kimi_shared_weight_layout == "rowmajor" else 256
+                )
+                shared_k_wave = kimi_shared_k_wave
+                if kimi_shared_grid_split:
+                    shared_grid_wgs = (
+                        kimi_shared_grid_split_k * (768 // shared_tile_n)
+                    )
+                else:
+                    shared_m_blocks = tile_m // 16
+                    shared_grid_wgs = shared_m_blocks * (768 // shared_tile_n)
+                shared_grid_y = (
+                    shared_grid_wgs + shared_grid_x - 1
+                ) // shared_grid_x
+                shared_grid_y_idx = arith.constant(shared_grid_y, index=True)
+                if const_expr(shared_wg_interleave > 0):
+                    # Launch one shared row for every N routed rows. q(y) is
+                    # the number of shared rows before unified row y. The
+                    # first term creates one shared then N routed rows, capped
+                    # when shared rows run out; the second switches to a shared-only tail
+                    # when routed rows run out. This keeps the grid unchanged
+                    # and maps every routed/shared row exactly once.
+                    zero_idx = arith.constant(0, index=True)
+                    one_idx = arith.constant(1, index=True)
+                    routed_per_shared_idx = arith.constant(
+                        shared_wg_interleave, index=True
+                    )
+                    stripe_width_idx = arith.constant(
+                        shared_wg_interleave + 1, index=True
+                    )
+
+                    def shared_rows_before(unified_row):
+                        striped = arith.divui(
+                            unified_row + routed_per_shared_idx,
+                            stripe_width_idx,
+                        )
+                        striped = arith.select(
+                            arith.cmpi(
+                                CmpIPredicate.ult,
+                                striped,
+                                shared_grid_y_idx,
+                            ),
+                            striped,
+                            shared_grid_y_idx,
+                        )
+                        routed_exhausted = arith.select(
+                            arith.cmpi(
+                                CmpIPredicate.ugt,
+                                unified_row,
+                                size_expert_ids_in,
+                            ),
+                            unified_row - size_expert_ids_in,
+                            zero_idx,
+                        )
+                        return arith.select(
+                            arith.cmpi(
+                                CmpIPredicate.ugt,
+                                striped,
+                                routed_exhausted,
+                            ),
+                            striped,
+                            routed_exhausted,
+                        )
+
+                    shared_before = shared_rows_before(bx_persist)
+                    shared_through = shared_rows_before(bx_persist + one_idx)
+                    is_shared_wg = arith.cmpi(
+                        CmpIPredicate.ugt,
+                        shared_through,
+                        shared_before,
+                    )
+                    shared_row = shared_before
+                    routed_row = bx_persist - shared_before
+                elif const_expr(kimi_shared_wg_schedule == "centered"):
+                    # Evenly merge S shared rows into U=R+S total rows. q(y)
+                    # counts shared rows before y; phi centers the rounding.
+                    one_idx = arith.constant(1, index=True)
+                    two_idx = arith.constant(2, index=True)
+                    unified_grid_y_idx = size_expert_ids_in + shared_grid_y_idx
+                    center_phi = arith.divui(
+                        unified_grid_y_idx - one_idx,
+                        two_idx,
+                    )
+                    shared_before = arith.divui(
+                        bx_persist * shared_grid_y_idx + center_phi,
+                        unified_grid_y_idx,
+                    )
+                    shared_through = arith.divui(
+                        (bx_persist + one_idx) * shared_grid_y_idx + center_phi,
+                        unified_grid_y_idx,
+                    )
+                    is_shared_wg = arith.cmpi(
+                        CmpIPredicate.ugt,
+                        shared_through,
+                        shared_before,
+                    )
+                    shared_row = shared_before
+                    routed_row = bx_persist - shared_before
+                elif const_expr(kimi_shared_wg_schedule == "suffix"):
+                    routed_grid_y_idx = size_expert_ids_in
+                    is_shared_wg = arith.cmpi(
+                        CmpIPredicate.uge,
+                        bx_persist,
+                        routed_grid_y_idx,
+                    )
+                    shared_row = bx_persist - routed_grid_y_idx
+                    routed_row = bx_persist
+                else:
+                    is_shared_wg = arith.cmpi(
+                        CmpIPredicate.ult,
+                        bx_persist,
+                        shared_grid_y_idx,
+                    )
+                    shared_row = bx_persist
+                    routed_row = bx_persist - shared_grid_y_idx
+                shared_if = scf.IfOp(is_shared_wg, has_else=True)
+                with ir.InsertionPoint(shared_if.then_block):
+                    for _ in range_constexpr(kimi_shared_start_sleep):
+                        llvm.InlineAsmOp(
+                            res=None,
+                            operands_=[],
+                            asm_string="s_sleep 127",
+                            constraints="",
+                            has_side_effects=True,
+                            is_align_stack=False,
+                        )
+                    tx_i32 = fx.Int32(tx)
+                    lane_i32 = tx_i32 % fx.Int32(64)
+                    wave_i32 = rocdl.readfirstlane(
+                        T.i32, tx_i32 // fx.Int32(64)
+                    )
+                    shared_bx_i32 = fx.Int32(
+                        shared_row * arith.constant(shared_grid_x, index=True) + by
+                    )
+                    shared_lds_base_i32 = fx.Int32(
+                        memref.extract_aligned_pointer_as_index(base_ptr_ping)
+                    )
+                    shared_lds_ptr_ty = fx.PointerType.get(
+                        T.i8, fx.AddressSpace.Shared, 16
+                    )
+                    shared_lds_raw_ptr = fx.inttoptr(
+                        shared_lds_ptr_ty, shared_lds_base_i32
+                    )
+                    shared_situ = situ_params(
+                        f32_situ_beta,
+                        f32_situ_beta_rcp,
+                        f32_situ_linear_beta,
+                        f32_situ_linear_beta_rcp,
+                        f32_swiglu_limit,
+                    )
+                    _gemm1_body_a16w4(
+                        shared_lds_raw_ptr,
+                        fx.Int64(fx.ptrtoint(arg_shared_scale_w)),
+                        fx.Int64(fx.ptrtoint(arg_shared_w)),
+                        fx.Int64(fx.ptrtoint(arg_shared_w)),
+                        fx.Int64(fx.ptrtoint(arg_scale_x)),
+                        fx.Int64(fx.ptrtoint(arg_sorted_weights)),
+                        fx.Int64(fx.ptrtoint(arg_bias)),
+                        fx.Int64(fx.ptrtoint(arg_out_scale_sorted)),
+                        shared_bx_i32,
+                        lane_i32,
+                        wave_i32,
+                        i32_tokens_in,
+                        shared_situ,
+                        BM=16,
+                        SORT_BM=16,
+                        TILE_N=shared_tile_n,
+                        TILE_K=shared_tile_k,
+                        K=7168,
+                        INTER=768,
+                        NE=1,
+                        TOPK=1,
+                        act="situv2",
+                        b_cache_mod=resolved_shared_b_cache_mod,
+                        w_dtype="bf16",
+                        w_layout=(
+                            "rowmajor"
+                            if kimi_shared_weight_layout == "rowmajor"
+                            else "standard"
+                        ),
+                        k_wave=shared_k_wave,
+                        use_k16=False,
+                        shared_wave_local_wait=kimi_shared_wave_local_wait,
+                        shared_pipeline_wait=kimi_shared_pipeline_wait,
+                        grid_split_k=kimi_shared_grid_split_k,
+                        grid_split_n_major=kimi_shared_grid_n_major,
+                        shared_fused_reduce=kimi_shared_fused_reduce,
+                        identity_m_indices=kimi_shared_identity_m_indices,
+                        a_lds_swizzle=kimi_shared_a_lds_swizzle,
+                        vec2_partials=kimi_shared_vec2_partials,
+                        split_workspace_rows=8,
+                        arg_split_workspace=fx.Int64(fx.ptrtoint(arg_scale_x)),
+                        arg_split_semaphore=fx.Int64(fx.ptrtoint(arg_bias)),
+                        num_waves=num_waves_total,
+                    )
+                    scf.YieldOp([])
+                routed_ip = ir.InsertionPoint(shared_if.else_block)
+                routed_ip.__enter__()
+                if const_expr(kimi_routed_priority3):
+                    rocdl.s_setprio(3)
+                bx_persist = routed_row
+
             if const_expr(xcd_swizzle > 0):
                 num_xcds = 8
                 one = arith.constant(1, index=True)
@@ -585,8 +1414,6 @@ def compile_mixed_moe_gemm1_common(
             layout_tx_wave_lane = fx.make_layout((num_waves_total, 64), stride=(64, 1))
             layout_lane16 = fx.make_layout((4, 16), stride=(16, 1))
 
-            base_ptr_pong = allocator_pong.get_base()
-            base_ptr_ping = allocator_ping.get_base()
             lds_x_pong = SmemPtr(
                 base_ptr_pong, lds_pong_offset, x_lds_elem(), shape=(input_elems,)
             ).get()
@@ -627,7 +1454,8 @@ def compile_mixed_moe_gemm1_common(
             ).get()
 
             c_a_pack = arith.constant(int(a_elem_vec_pack), index=True)
-            c_elem_bytes = arith.constant(int(a_elem_bytes), index=True)
+            source_a_elem_bytes = 2 if a_source_bf16 else int(a_elem_bytes)
+            c_elem_bytes = arith.constant(source_a_elem_bytes, index=True)
 
             x_nbytes_idx = (tokens_in * k_in * c_elem_bytes) // c_a_pack
             x_nbytes_i32 = arith.index_cast(T.i32, x_nbytes_idx)
@@ -732,7 +1560,7 @@ def compile_mixed_moe_gemm1_common(
             exp_valid = arith.cmpi(
                 CmpIPredicate.ult, expert_i32, arith.constant(experts, type=T.i32)
             )
-            if const_expr(heterogeneous_b):
+            if const_expr(shared_expert_id is not None):
                 is_shared_expert = arith.cmpi(
                     CmpIPredicate.eq,
                     expert_i32,
@@ -747,7 +1575,10 @@ def compile_mixed_moe_gemm1_common(
                 body_b_load_mult = 2 if body_b_has_full_operand else 1
                 body_vmcnt_before_barrier = (
                     tile_m // 32 // fp4_ratio
-                    + tile_n // 32 * gui_ratio * body_b_load_mult
+                    + pipe_num_acc_n
+                    * pipe_k_unroll
+                    * gui_ratio
+                    * body_b_load_mult
                 )
                 expert_off_idx = expert_idx * arith.constant(2 * inter_dim, index=True)
                 if const_expr(shared_b):
@@ -806,10 +1637,20 @@ def compile_mixed_moe_gemm1_common(
                     (tile_m, tile_k_dwords), stride=(tile_k_dwords, 1)
                 )
                 c_chunk_i32 = arith.constant(chunk_i32, index=True)
-                if const_expr(k_wave > 1):
+                partial_a_loader = a_load_threads < total_threads
+                if const_expr(k_wave > 1 or partial_a_loader):
                     x_load_tid = tx % arith.constant(a_load_threads, index=True)
                 else:
                     x_load_tid = tx
+                a_load_active = (
+                    arith.cmpi(
+                        CmpIPredicate.ult,
+                        tx,
+                        arith.constant(a_load_threads, index=True),
+                    )
+                    if partial_a_loader
+                    else None
+                )
                 tx_i32_base = x_load_tid * c_chunk_i32
 
                 topk_i32 = arith.constant(topk)
@@ -826,7 +1667,108 @@ def compile_mixed_moe_gemm1_common(
                         chunk_i32=chunk_i32,
                     )
 
+                def load_x_raw_half(idx_i32, half):
+                    # idx_i32 is the destination FP8 dword coordinate. One
+                    # 16-byte FP8 chunk corresponds to 16 BF16 source values.
+                    src_elem = (
+                        idx_i32 * arith.index(4)
+                        + arith.index(half * 8)
+                    )
+                    return _buffer_load_vec(
+                        buffer_ops,
+                        vector,
+                        x_rsrc,
+                        src_elem,
+                        elem_type=T.bf16,
+                        vec_elems=8,
+                        elem_bytes=2,
+                        offset_in_bytes=False,
+                    )
+
+                def load_x_raw(idx_i32):
+                    return (
+                        load_x_raw_half(idx_i32, 0),
+                        load_x_raw_half(idx_i32, 1),
+                    )
+
+                def pack4_fp8(src_bf16, base):
+                    one_f32 = arith.constant(1.0, type=T.f32)
+                    packed = vector.from_elements(
+                        T.vec(2, T.i16),
+                        [
+                            arith.constant(0, type=T.i16),
+                            arith.constant(0, type=T.i16),
+                        ],
+                    )
+                    for pair in range_constexpr(2):
+                        elem = base + pair * 2
+                        src_pair = vector.from_elements(
+                            T.vec(2, T.bf16),
+                            [
+                                vector.extract(
+                                    src_bf16,
+                                    static_position=[elem],
+                                    dynamic_position=[],
+                                ),
+                                vector.extract(
+                                    src_bf16,
+                                    static_position=[elem + 1],
+                                    dynamic_position=[],
+                                ),
+                            ],
+                        )
+                        packed = rocdl.cvt_scalef32_pk_fp8_bf16(
+                            T.vec(2, T.i16),
+                            packed,
+                            src_pair,
+                            one_f32,
+                            pair,
+                        )
+                    packed_i32x1 = vector.bitcast(T.vec(1, T.i32), packed)
+                    return vector.extract(
+                        packed_i32x1,
+                        static_position=[0],
+                        dynamic_position=[],
+                    )
+
+                def pack_x_raw_half(src_bf16):
+                    return vector.from_elements(
+                        vec2_i32,
+                        [pack4_fp8(src_bf16, 0), pack4_fp8(src_bf16, 4)],
+                    )
+
+                def pack_x_raw(raw):
+                    packed_lo = pack_x_raw_half(raw[0])
+                    packed_hi = pack_x_raw_half(raw[1])
+                    return vector.from_elements(
+                        vec4_i32,
+                        [
+                            vector.extract(
+                                packed_lo,
+                                static_position=[0],
+                                dynamic_position=[],
+                            ),
+                            vector.extract(
+                                packed_lo,
+                                static_position=[1],
+                                dynamic_position=[],
+                            ),
+                            vector.extract(
+                                packed_hi,
+                                static_position=[0],
+                                dynamic_position=[],
+                            ),
+                            vector.extract(
+                                packed_hi,
+                                static_position=[1],
+                                dynamic_position=[],
+                            ),
+                        ],
+                    )
+
                 def load_x(idx_i32):
+                    if const_expr(a_source_bf16):
+                        return vector.bitcast(vec16_x, pack_x_raw(load_x_raw(idx_i32)))
                     idx_elem = (
                         idx_i32 if a_elem_bytes == 1 else (idx_i32 * arith.index(2))
                     )
@@ -837,6 +1779,7 @@ def compile_mixed_moe_gemm1_common(
                         idx_i32=idx_elem,
                         rsrc=x_rsrc,
                         vec_elems=vec16_elems,
+                        mask=a_load_active,
                     )
 
                 x_row_base_div4 = []
@@ -850,14 +1793,26 @@ def compile_mixed_moe_gemm1_common(
 
                     sorted_row_i = bx_m + row_local
                     fused_i = buffer_ops.buffer_load(
-                        sorted_rsrc, sorted_row_i, vec_width=1, dtype=T.i32
+                        sorted_rsrc,
+                        sorted_row_i,
+                        vec_width=1,
+                        dtype=T.i32,
+                        mask=a_load_active,
                     )
                     t_i32 = arith.andi(fused_i, mask24)
                     s_i32 = arith.shrui(fused_i, arith.constant(24))
                     t_valid = arith.cmpi(CmpIPredicate.ult, t_i32, tokens_i32)
                     s_valid = arith.cmpi(CmpIPredicate.ult, s_i32, topk_i32)
                     ts_valid = arith.andi(t_valid, s_valid)
-                    t_safe = arith.select(ts_valid, t_i32, arith.constant(0))
+                    # A buffer load at row=tokens is out of bounds and returns
+                    # zero without issuing the token-0 memory request. Keep the
+                    # legacy token-0 fallback unless this optimization is on.
+                    invalid_token = (
+                        tokens_i32
+                        if const_expr(mask_padded_a)
+                        else arith.constant(0, type=T.i32)
+                    )
+                    t_safe = arith.select(ts_valid, t_i32, invalid_token)
 
                     t_idx = arith.index_cast(ir.IndexType.get(), t_safe)
                     x_row_base_div4.append(t_idx * c_k_div4)
@@ -872,6 +1827,28 @@ def compile_mixed_moe_gemm1_common(
                         idx_i32 = x_row_base_div4[i] + base_k_div4 + x_col_local_i32[i]
                         x_vec = load_x(idx_i32)
                         parts.append(vector.bitcast(T.vec(4, i32), x_vec))
+                    return parts
+
+                def load_x_tile_raw(base_k):
+                    base_k_div4 = (
+                        (base_k // c_a_pack)
+                        * arith.constant(int(a_elem_bytes), index=True)
+                    ) // arith.index(4)
+                    parts = []
+                    for i in range_constexpr(num_x_loads):
+                        idx_i32 = x_row_base_div4[i] + base_k_div4 + x_col_local_i32[i]
+                        parts.append(load_x_raw(idx_i32))
+                    return parts
+
+                def load_x_tile_raw_half(base_k, half):
+                    base_k_div4 = (
+                        (base_k // c_a_pack)
+                        * arith.constant(int(a_elem_bytes), index=True)
+                    ) // arith.index(4)
+                    parts = []
+                    for i in range_constexpr(num_x_loads):
+                        idx_i32 = x_row_base_div4[i] + base_k_div4 + x_col_local_i32[i]
+                        parts.append(load_x_raw_half(idx_i32, half))
                     return parts
 
                 coord_wl = idx2crd(fx.Int32(tx), layout_tx_wave_lane)
@@ -905,7 +1882,7 @@ def compile_mixed_moe_gemm1_common(
 
                 num_acc_n = n_per_wave // 16
                 c_n_per_wave = arith.constant(n_per_wave, index=True)
-                wave_n_id = wave_id % arith.constant(num_waves, index=True)
+                wave_n_id = wave_id % arith.constant(num_n_waves, index=True)
                 n_tile_base = wave_n_id * c_n_per_wave
 
                 gate_n_intra_list = []
@@ -1069,6 +2046,52 @@ def compile_mixed_moe_gemm1_common(
                             up_b_tile.append((u_packs0, u_packs1, u_packs2, u_packs3))
                     return gate_b_tile, up_b_tile
 
+                def load_gate_b_slot(base_k, b_slot: int):
+                    """Load one routed gate/interleaved B slot for the exact
+                    four-slot Kimi-K3 Stage1 pipeline."""
+                    b_type, b_ku, b_ni = pipe_b_loads[b_slot]
+                    assert b_type == "gate"
+                    return load_b_packs_k64(
+                        base_k,
+                        b_ku,
+                        gate_n_blk_list[b_ni],
+                        gate_n_intra_list[b_ni],
+                    )
+
+                def complete_gate_b_tile_from_half_seed(base_k, half_seed):
+                    """Complete slots 2/3 around carried slots 0/1.
+
+                    This helper is used only by the strictly gated Kimi-K3
+                    half-tile carry tail.  It emits two B loads, so the full
+                    K loop retains exactly the baseline B-load count.
+                    """
+                    b_cells = {}
+                    for seed_i in range_constexpr(len(pipe_b_half_seed_slots)):
+                        seed_slot = pipe_b_half_seed_slots[seed_i]
+                        _, seed_ku, seed_ni = pipe_b_loads[seed_slot]
+                        b_cells[(seed_ku, seed_ni)] = half_seed[seed_i]
+                    for fill_i in range_constexpr(len(pipe_b_half_fill_slots)):
+                        fill_slot = pipe_b_half_fill_slots[fill_i]
+                        _, fill_ku, fill_ni = pipe_b_loads[fill_slot]
+                        b_cells[(fill_ku, fill_ni)] = load_gate_b_slot(
+                            base_k, fill_slot
+                        )
+
+                    gate_b_tile = []
+                    for ku in range_constexpr(k_unroll):
+                        g_packs0, g_packs1, g_packs2, g_packs3 = [], [], [], []
+                        for ni in range_constexpr(num_acc_n):
+                            g = b_cells[(ku, ni)]
+                            g_packs0.append(g[0])
+                            g_packs1.append(g[1])
+                            if const_expr(body_b_has_full_operand):
+                                g_packs2.append(g[2])
+                                g_packs3.append(g[3])
+                        gate_b_tile.append(
+                            (g_packs0, g_packs1, g_packs2, g_packs3)
+                        )
+                    return gate_b_tile, None
+
                 scale_lane_elem = (
                     lane_div_16 * layout_b_scale.stride_klane + lane_mod_16
                 )
@@ -1209,10 +2232,10 @@ def compile_mixed_moe_gemm1_common(
                 lds_base_zero = arith.index(0)
 
                 def store_x_tile_to_lds(vec_x_in_parts, lds_buffer):
-                    for i in range_constexpr(num_x_loads):
-                        row_local = x_row_local[i]
-                        col_local_i32 = x_col_local_i32[i]
-                        if const_expr(x_load_bytes == 16):
+                    def store_parts():
+                        for i in range_constexpr(num_x_loads):
+                            row_local = x_row_local[i]
+                            col_local_i32 = x_col_local_i32[i]
                             lds_store_16b_xor16(
                                 arith,
                                 vector,
@@ -1227,6 +2250,34 @@ def compile_mixed_moe_gemm1_common(
                                 vec_part_i32x4=vec_x_in_parts[i],
                                 elem_bytes=elem_bytes,
                             )
+
+                    if const_expr(partial_a_loader):
+                        store_if = scf.IfOp(
+                            a_load_active, results_=[], has_else=False
+                        )
+                        with _if_then(store_if):
+                            store_parts()
+                    else:
+                        store_parts()
+
+                def store_x_raw_half_to_lds(raw_parts, half, lds_buffer):
+                    for i in range_constexpr(num_x_loads):
+                        lds_store_8b_xor16(
+                            arith,
+                            vector,
+                            lds_memref=lds_buffer,
+                            vec8_ty=vec8_x,
+                            layout_lds=layout_lds,
+                            row_local=x_row_local[i],
+                            col_local_i32=(
+                                x_col_local_i32[i] + arith.index(half * 2)
+                            ),
+                            tx_c4=arith.index(4),
+                            k_blocks16=k_blocks16,
+                            lds_base=lds_base_zero,
+                            vec_part_i32x2=pack_x_raw_half(raw_parts[i]),
+                            elem_bytes=elem_bytes,
+                        )
 
                 if const_expr(use_async_copy):
                     dma_bytes = 16
@@ -1613,6 +2664,7 @@ def compile_mixed_moe_gemm1_common(
                     lds_write,
                     next_k_dma_py,
                     next_k_load,
+                    next_gate_b_half_seed,
                     prev_a_tile,
                     prev_gate_w,
                     prev_up_w,
@@ -1635,6 +2687,13 @@ def compile_mixed_moe_gemm1_common(
                     """
                     abs_k = body_k_base_idx + arith.constant(next_k_load, index=True)
                     bk = abs_k // arith.constant(b_byte_div, index=True)
+                    if const_expr(kimi_routed_b_half_carry):
+                        far_abs_k = body_k_base_idx + arith.constant(
+                            next_k_load + tile_k, index=True
+                        )
+                        far_bk = far_abs_k // arith.constant(
+                            b_byte_div, index=True
+                        )
                     sk = abs_k // arith.constant(pack_K * 128, index=True)
                     k_off = sk * layout_b_scale.stride_k0
 
@@ -1649,10 +2708,27 @@ def compile_mixed_moe_gemm1_common(
                     abs_k_dma = body_k_base_idx + arith.constant(
                         next_k_dma_py, index=True
                     )
-                    if const_expr(use_async_copy and next_k_dma_py < int(k_dim)):
+                    # next_k_dma_py is relative to this K-wave's segment.
+                    # Guard against crossing klen when k_wave > 1.
+                    prefetch_next_a = next_k_dma_py < int(klen)
+                    if const_expr(use_async_copy and prefetch_next_a):
                         prefetch_x_to_lds(abs_k_dma, lds_write)
-                    if const_expr(not use_async_copy):
-                        x_regs = load_x_tile(abs_k_dma)
+                    x_regs = []
+                    x_raw_half = []
+                    defer_bf16_pack = (
+                        bf16_load_ahead
+                        and a_source_bf16
+                        and num_x_loads == 1
+                        and pipe_n_phases >= 3
+                    )
+                    if const_expr(not use_async_copy and prefetch_next_a):
+                        if const_expr(defer_bf16_pack):
+                            # Keep only one 16-byte BF16 half live across the
+                            # MFMA phases.  Holding both halves here crosses the
+                            # 96-VGPR boundary on gfx950 and spills to scratch.
+                            x_raw_half = load_x_tile_raw_half(abs_k_dma, 0)
+                        else:
+                            x_regs = load_x_tile(abs_k_dma)
 
                     prev_asvs = []
                     for i_as in range_constexpr(len(prev_a_scale)):
@@ -1686,6 +2762,17 @@ def compile_mixed_moe_gemm1_common(
                     a_all = {}
                     b_gate_all = {}
                     b_up_all = {}
+                    far_gate_b_half_seed = []
+
+                    if const_expr(kimi_routed_b_half_carry):
+                        for seed_i in range_constexpr(
+                            len(pipe_b_half_seed_slots)
+                        ):
+                            seed_slot = pipe_b_half_seed_slots[seed_i]
+                            _, seed_ku, seed_ni = pipe_b_loads[seed_slot]
+                            b_gate_all[(seed_ku, seed_ni)] = (
+                                next_gate_b_half_seed[seed_i]
+                            )
 
                     for _p in range_constexpr(pipe_n_phases):
                         if const_expr(pp_has_scale[_p]):
@@ -1730,26 +2817,35 @@ def compile_mixed_moe_gemm1_common(
                                         )
                                         new_us_list.append(rearrange_b_scale(us_raw))
 
-                        for b_j in range_constexpr(len(pp_b_loads[_p])):
-                            b_type, b_ku, b_ni = pp_b_loads[_p][b_j]
-                            if const_expr(b_type == "gate"):
-                                b_gate_all[(b_ku, b_ni)] = load_b_packs_k64(
-                                    bk,
-                                    b_ku,
-                                    gate_n_blk_list[b_ni],
-                                    gate_n_intra_list[b_ni],
-                                )
-                            else:
-                                b_up_all[(b_ku, b_ni)] = load_b_packs_k64(
-                                    bk,
-                                    b_ku,
-                                    up_n_blk_list[b_ni],
-                                    up_n_intra_list[b_ni],
-                                )
+                        if const_expr(
+                            not kimi_routed_b_ring4
+                            and not kimi_routed_b_early4
+                            and not kimi_routed_b_half_carry
+                        ):
+                            for b_j in range_constexpr(len(pp_b_loads[_p])):
+                                b_type, b_ku, b_ni = pp_b_loads[_p][b_j]
+                                if const_expr(b_type == "gate"):
+                                    b_gate_all[(b_ku, b_ni)] = load_b_packs_k64(
+                                        bk,
+                                        b_ku,
+                                        gate_n_blk_list[b_ni],
+                                        gate_n_intra_list[b_ni],
+                                    )
+                                else:
+                                    b_up_all[(b_ku, b_ni)] = load_b_packs_k64(
+                                        bk,
+                                        b_ku,
+                                        up_n_blk_list[b_ni],
+                                        up_n_intra_list[b_ni],
+                                    )
 
                         rocdl.sched_barrier(0)
                         for a_j in range_constexpr(len(pp_a_reads[_p])):
                             ak, ami = pp_a_reads[_p][a_j]
+                            if kimi_routed_a_ring2 and ami == 0 and ak in (0, 1):
+                                continue
+                            if kimi_routed_late_a1 and ak == 1 and ami == 0:
+                                continue
                             a_all[(ak, ami)] = load_a_subtile(
                                 ak,
                                 ami,
@@ -1757,7 +2853,7 @@ def compile_mixed_moe_gemm1_common(
                             )
                         rocdl.sched_barrier(0)
 
-                        rocdl.s_setprio(1)
+                        rocdl.s_setprio(3 if kimi_routed_priority3 else 1)
                         for m_j in range_constexpr(len(pp_mfma[_p])):
                             k_idx, ni_idx, ikxdl, inxdl, ku128 = pp_mfma[_p][m_j]
                             ni_packed_idx = ni_idx // pack_N
@@ -1772,6 +2868,7 @@ def compile_mixed_moe_gemm1_common(
                                     )
                                 return (tile_entry[0][ni], tile_entry[1][ni])
 
+                            gate_b_single = mk_single(prev_gate_w[k_idx], ni_idx)
                             up_b_single = (
                                 mk_single(prev_up_w[k_idx], ni_idx)
                                 if not single_b_pipe
@@ -1781,7 +2878,7 @@ def compile_mixed_moe_gemm1_common(
                             bs_idx = ku128 * num_acc_n_packed + ni_packed_idx
                             compute_bmajor_mfma_phase(
                                 prev_a_tile,
-                                mk_single(prev_gate_w[k_idx], ni_idx),
+                                gate_b_single,
                                 up_b_single,
                                 prev_asvs[as_off : as_off + m_repeat_packed],
                                 prev_gsv_list[bs_idx],
@@ -1793,8 +2890,123 @@ def compile_mixed_moe_gemm1_common(
                                 ikxdl,
                                 inxdl,
                             )
-                        rocdl.s_setprio(0)
+                        rocdl.s_setprio(3 if kimi_routed_priority3 else 0)
+                        if const_expr(kimi_routed_a_ring2):
+                            # Anchor the completed current-half MFMA group
+                            # before any next-half A refill scheduling hints.
+                            rocdl.sched_mfma(len(pp_mfma[_p]))
+                        if const_expr(
+                            kimi_routed_a_ring2 and _p == pipe_n_phases - 1
+                        ):
+                            # A(k=1) is dead after the final phase; keep the
+                            # same two-slot cadence for the next half.
+                            a_all[(1, 0)] = load_a_subtile(1, 0, lds_read)
+                            rocdl.sched_dsrd(2)
+                            rocdl.sched_barrier(0)
+                        if const_expr(kimi_routed_b_early4 and _p < 3):
+                            # Keep B0 at p0 and pull B1..B3 one phase earlier:
+                            # p0 -> B0+B1, p1 -> B2, p2 -> B3, p3 -> none.
+                            # A-ring2 anchors the current MFMA group above;
+                            # source-native FP8 uses the equivalent local anchor.
+                            for b_j in range_constexpr(
+                                len(pipe_b_early4_slots[_p])
+                            ):
+                                b_slot = pipe_b_early4_slots[_p][b_j]
+                                b_type, b_ku, b_ni = pipe_b_loads[b_slot]
+                                if const_expr(b_type == "gate"):
+                                    b_gate_all[(b_ku, b_ni)] = load_b_packs_k64(
+                                        bk,
+                                        b_ku,
+                                        gate_n_blk_list[b_ni],
+                                        gate_n_intra_list[b_ni],
+                                    )
+                                else:
+                                    b_up_all[(b_ku, b_ni)] = load_b_packs_k64(
+                                        bk,
+                                        b_ku,
+                                        up_n_blk_list[b_ni],
+                                        up_n_intra_list[b_ni],
+                                    )
+                            if const_expr(not kimi_routed_a_ring2):
+                                rocdl.sched_mfma(len(pp_mfma[_p]))
+                            rocdl.sched_vmem(len(pipe_b_early4_slots[_p]))
+                            rocdl.sched_barrier(0)
+                        if const_expr(kimi_routed_b_ring4):
+                            # Refill one next-half B slot only after this phase
+                            # consumes the corresponding current-half slot.
+                            # Each block retains roughly three phases of VMEM
+                            # latency hiding while only four B blocks stay live.
+                            b_type, b_ku, b_ni = pipe_b_loads[_p]
+                            if const_expr(b_type == "gate"):
+                                b_gate_all[(b_ku, b_ni)] = load_b_packs_k64(
+                                    bk,
+                                    b_ku,
+                                    gate_n_blk_list[b_ni],
+                                    gate_n_intra_list[b_ni],
+                                )
+                            else:
+                                b_up_all[(b_ku, b_ni)] = load_b_packs_k64(
+                                    bk,
+                                    b_ku,
+                                    up_n_blk_list[b_ni],
+                                    up_n_intra_list[b_ni],
+                                )
+                            if const_expr(not kimi_routed_a_ring2):
+                                rocdl.sched_mfma(len(pp_mfma[_p]))
+                            rocdl.sched_vmem(1)
+                            rocdl.sched_barrier(0)
+                        if const_expr(kimi_routed_b_half_carry):
+                            # Slots 0/1 of this half were carried across the
+                            # previous iteration.  Refill its missing slots
+                            # 2/3 in phases 0/1, then use phases 2/3 to launch
+                            # slots 0/1 for the tile after next.  The steady
+                            # state still issues exactly four B loads per K
+                            # tile, while half the tile gets a two-iteration
+                            # latency window.
+                            if const_expr(_p < len(pipe_b_half_fill_slots)):
+                                carry_slot = pipe_b_half_fill_slots[_p]
+                                _, carry_ku, carry_ni = pipe_b_loads[carry_slot]
+                                b_gate_all[(carry_ku, carry_ni)] = (
+                                    load_gate_b_slot(bk, carry_slot)
+                                )
+                            else:
+                                far_slot = pipe_b_half_seed_slots[
+                                    _p - len(pipe_b_half_fill_slots)
+                                ]
+                                far_gate_b_half_seed.append(
+                                    load_gate_b_slot(far_bk, far_slot)
+                                )
+                            if const_expr(not kimi_routed_a_ring2):
+                                rocdl.sched_mfma(len(pp_mfma[_p]))
+                            rocdl.sched_vmem(1)
+                            rocdl.sched_barrier(0)
+                        if const_expr(
+                            defer_bf16_pack and prefetch_next_a and _p == 1
+                        ):
+                            store_x_raw_half_to_lds(x_raw_half, 0, lds_write)
+                            # Reuse the low-half source registers for the high
+                            # half, then hide that VMEM load behind the next
+                            # phase's MFMA work.
+                            x_raw_half = load_x_tile_raw_half(abs_k_dma, 1)
+                            rocdl.sched_barrier(0)
+                        if const_expr(
+                            defer_bf16_pack and prefetch_next_a and _p == 2
+                        ):
+                            store_x_raw_half_to_lds(x_raw_half, 1, lds_write)
+                            rocdl.sched_barrier(0)
+                        if const_expr(kimi_routed_a_ring2 and _p == 2):
+                            # A(k=0) has been dead since phase 1.  Refill it
+                            # only after the high BF16 half is packed/stored,
+                            # avoiding overlap with the raw-high registers.
+                            a_all[(0, 0)] = load_a_subtile(0, 0, lds_read)
+                            rocdl.sched_dsrd(2)
+                            rocdl.sched_barrier(0)
                         rocdl.sched_barrier(0)
+                        if const_expr(
+                            kimi_routed_late_a1 and _p == pipe_n_phases - 1
+                        ):
+                            a_all[(1, 0)] = load_a_subtile(1, 0, lds_read)
+                            rocdl.sched_barrier(0)
 
                     cur_a_tile = []
                     for k in range_constexpr(k_unroll):
@@ -1822,7 +3034,9 @@ def compile_mixed_moe_gemm1_common(
                                     u_packs3.append(u[3])
                         cur_gate_w.append((g_packs0, g_packs1, g_packs2, g_packs3))
                         if const_expr(not single_b_pipe):
-                            cur_up_w.append((u_packs0, u_packs1, u_packs2, u_packs3))
+                            cur_up_w.append(
+                                (u_packs0, u_packs1, u_packs2, u_packs3)
+                            )
 
                     cur_a_scale = []
                     for i_as in range_constexpr(len(new_as_list)):
@@ -1848,7 +3062,11 @@ def compile_mixed_moe_gemm1_common(
                     else:
                         cur_up_bs = None
 
-                    if const_expr(not use_async_copy):
+                    if const_expr(
+                        not use_async_copy
+                        and prefetch_next_a
+                        and not defer_bf16_pack
+                    ):
                         store_x_tile_to_lds(x_regs, lds_write)
 
                     return (
@@ -1858,6 +3076,7 @@ def compile_mixed_moe_gemm1_common(
                         cur_a_scale,
                         cur_gate_bs,
                         cur_up_bs,
+                        far_gate_b_half_seed,
                         acc_gate,
                         acc_up,
                     )
@@ -1894,11 +3113,12 @@ def compile_mixed_moe_gemm1_common(
 
                 k1 = body_k_base_idx + arith.constant(tile_k, index=True)
                 rocdl.sched_barrier(0)
-                if const_expr(use_async_copy):
-                    prefetch_x_to_lds(k1, body_lds_x_ping)
-                else:
-                    x_regs_prime = load_x_tile(k1)
-                    store_x_tile_to_lds(x_regs_prime, body_lds_x_ping)
+                if const_expr(int(klen) > int(tile_k)):
+                    if const_expr(use_async_copy):
+                        prefetch_x_to_lds(k1, body_lds_x_ping)
+                    else:
+                        x_regs_prime = load_x_tile(k1)
+                        store_x_tile_to_lds(x_regs_prime, body_lds_x_ping)
 
                 k0_b = body_k_base_idx // arith.constant(b_byte_div, index=True)
                 gate_w0, up_w0 = load_b_tile(k0_b)
@@ -1921,6 +3141,24 @@ def compile_mixed_moe_gemm1_common(
                 gate_w_pong = gate_w0
                 up_w_pong = up_w0
 
+                gate_b_half_seed = None
+                if const_expr(kimi_routed_b_half_carry):
+                    # Seed slots 0/1 of B1 after the existing B0 readiness
+                    # wait, so the experimental loads do not perturb the
+                    # prologue's baseline wait-count contract.
+                    k1_b = k1 // arith.constant(b_byte_div, index=True)
+                    gate_b_half_seed = []
+                    for seed_i in range_constexpr(
+                        len(pipe_b_half_seed_slots)
+                    ):
+                        gate_b_half_seed.append(
+                            load_gate_b_slot(
+                                k1_b, pipe_b_half_seed_slots[seed_i]
+                            )
+                        )
+                    rocdl.sched_vmem(len(pipe_b_half_seed_slots))
+                    rocdl.sched_barrier(0)
+
                 rocdl.sched_barrier(0)
 
                 if const_expr(k_main2_py > 0):
@@ -1937,6 +3175,7 @@ def compile_mixed_moe_gemm1_common(
                             a_scale_ping,
                             gate_bs_ping,
                             up_bs_ping,
+                            gate_b_half_seed,
                             acc_gate,
                             acc_up,
                         ) = interleaved_half(
@@ -1944,6 +3183,7 @@ def compile_mixed_moe_gemm1_common(
                             body_lds_x_pong,
                             next_k_dma_1,
                             next_k_load_1,
+                            gate_b_half_seed,
                             a_tile_pong,
                             gate_w_pong,
                             up_w_pong,
@@ -1961,6 +3201,7 @@ def compile_mixed_moe_gemm1_common(
                             a_scale_pong,
                             gate_bs_pong,
                             up_bs_pong,
+                            gate_b_half_seed,
                             acc_gate,
                             acc_up,
                         ) = interleaved_half(
@@ -1968,6 +3209,7 @@ def compile_mixed_moe_gemm1_common(
                             body_lds_x_ping,
                             next_k_dma_2,
                             next_k_load_2,
+                            gate_b_half_seed,
                             a_tile_ping,
                             gate_w_ping,
                             up_w_ping,
@@ -1994,12 +3236,19 @@ def compile_mixed_moe_gemm1_common(
                 else:
                     k_tail_rel = arith.constant(klen - tile_k, index=True)
                     k_tail1 = body_k_base_idx + k_tail_rel
-                    x_regs_ping = []
-                    if const_expr(use_async_copy):
-                        prefetch_x_to_lds(k_tail1, body_lds_x_ping)
-                    else:
-                        x_regs_ping = load_x_tile(k_tail1)
-                    if const_expr(pad_ku_skip > 0):
+                    if const_expr(kimi_routed_b_half_carry):
+                        gate_w_ping, up_w_ping = complete_gate_b_tile_from_half_seed(
+                            k_tail1 // arith.constant(b_byte_div, index=True),
+                            gate_b_half_seed,
+                        )
+                        (
+                            a_scale_ping,
+                            gate_bs_ping,
+                            up_bs_ping,
+                        ) = prefetch_ab_scale_tile(
+                            k_tail1 // arith.constant(pack_K * 128, index=True)
+                        )
+                    elif const_expr(pad_ku_skip > 0):
                         gate_w_ping, up_w_ping = load_b_tile(
                             k_tail1 // arith.constant(b_byte_div, index=True),
                             ku_limit=tail_ku,
@@ -2033,8 +3282,9 @@ def compile_mixed_moe_gemm1_common(
                         gate_bs_pong,
                         up_bs_pong,
                     )
-                    if const_expr(not use_async_copy):
-                        store_x_tile_to_lds(x_regs_ping, body_lds_x_ping)
+                    # The prologue (two-tile K) or the final interleaved half
+                    # already populated ping with the last A tile.  Re-loading
+                    # it here repeated one full BF16->FP8 conversion per K loop.
                     rocdl.s_waitcnt(0)
                     barrier()
                     if const_expr(pad_ku_skip > 0):
@@ -3050,7 +4300,7 @@ def compile_mixed_moe_gemm1_common(
             with ir.InsertionPoint(if_blk.then_block):
                 ifexpert_of = scf.IfOp(exp_valid)
                 with ir.InsertionPoint(ifexpert_of.then_block):
-                    if const_expr(heterogeneous_b):
+                    if const_expr(shared_expert_id is not None):
                         format_if = scf.IfOp(is_shared_expert, has_else=True)
                         with ir.InsertionPoint(format_if.then_block):
                             moe_gemm1_body(shared_b=True)
@@ -3066,6 +4316,11 @@ def compile_mixed_moe_gemm1_common(
             gpu.barrier()
             scf.YieldOp([])
             for_ip.__exit__(None, None, None)
+            if const_expr(kimi_shared_bf16):
+                if const_expr(kimi_routed_priority3):
+                    rocdl.s_setprio(0)
+                scf.YieldOp([])
+                routed_ip.__exit__(None, None, None)
 
     if heterogeneous_b:
 
@@ -3189,8 +4444,33 @@ def compile_mixed_moe_gemm1_common(
         k_batch,
         gate_mode,
         a_scale_one,
+        a_source_bf16,
+        bf16_load_ahead,
+        kimi_routed_late_a1,
+        kimi_routed_a_ring2,
+        kimi_routed_b_ring4,
+        kimi_routed_b_early4,
+        kimi_routed_b_half_carry,
+        kimi_routed_priority3,
         xcd_swizzle,
         v2_output_layout,
+        sort_block_m,
+        kimi_shared_bf16,
+        kimi_shared_weight_layout,
+        resolved_shared_b_cache_mod,
+        kimi_shared_wave_local_wait,
+        kimi_shared_pipeline_wait,
+        kimi_shared_start_sleep,
+        kimi_shared_wg_schedule,
+        kimi_shared_grid_split_k,
+        kimi_shared_grid_tile_n,
+        kimi_shared_grid_n_major,
+        kimi_shared_fused_reduce,
+        kimi_shared_identity_m_indices,
+        kimi_shared_a_lds_swizzle,
+        kimi_shared_vec2_partials,
+        kimi_shared_k_wave,
+        block_waves,
     )
     if heterogeneous_b:
         cache_tag += (shared_expert_id,)
@@ -3222,11 +4502,13 @@ def compile_mixed_moe_gemm1_common(
     ):
         _ = cache_tag
         allocator_pong.finalized = False
-        allocator_ping.finalized = False
+        if not kimi_shared_bf16:
+            allocator_ping.finalized = False
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
             allocator_pong.finalize()
-            allocator_ping.finalize()
+            if not kimi_shared_bf16:
+                allocator_ping.finalize()
 
         inter_dim_pad_total = arith.constant(2 * inter_dim_pad, index=True)
         tile2_pad = 0
@@ -3255,6 +4537,24 @@ def compile_mixed_moe_gemm1_common(
             + c_pm_l
             - arith.constant(1, index=True)
         ) // c_pm_l
+        if const_expr(kimi_shared_bf16):
+            shared_grid_x = (2 * inter_dim) // tile_n
+            shared_tile_n = (
+                kimi_shared_grid_tile_n
+                if kimi_shared_grid_split
+                else (16 if kimi_shared_weight_layout == "rowmajor" else 32)
+            )
+            if kimi_shared_grid_split:
+                shared_grid_wgs = (
+                    kimi_shared_grid_split_k * (768 // shared_tile_n)
+                )
+            else:
+                shared_m_blocks = tile_m // 16
+                shared_grid_wgs = shared_m_blocks * (768 // shared_tile_n)
+            shared_grid_y = (
+                shared_grid_wgs + shared_grid_x - 1
+            ) // shared_grid_x
+            gy = gy + arith.constant(shared_grid_y, index=True)
 
         if const_expr(heterogeneous_b):
             launcher = moe_gemm1(
@@ -3304,7 +4604,7 @@ def compile_mixed_moe_gemm1_common(
                 f32_situ_linear_beta_rcp,
                 f32_swiglu_limit,
             )
-        if const_expr(heterogeneous_b and waves_per_eu is not None):
+        if const_expr(waves_per_eu is not None and waves_per_eu >= 1):
             wpe = int(waves_per_eu)
             for op in ctx.gpu_module_body.operations:
                 if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
@@ -4122,43 +5422,64 @@ def compile_mixed_moe_gemm2_common(
                         offset_in_bytes=True,
                     )
 
-                if const_expr(use_async_copy and a_elem_vec_pack > 1):
-                    dma_bytes_pre = 16
-                    eff_bytes_pre = (
-                        int(tile_m) * int(eff_lds_stride) * int(a_elem_bytes)
-                    )
-                    num_x_addr_loads = max(
-                        1, eff_bytes_pre // (total_threads * dma_bytes_pre)
-                    )
-                else:
-                    num_x_addr_loads = num_x_loads
+                dma_bytes = 16
+                eff_bytes_per_buffer = (
+                    int(tile_m) * int(eff_lds_stride) * int(a_elem_bytes)
+                )
+                num_dma_vecs = eff_bytes_per_buffer // dma_bytes
+                num_dma_loads = (
+                    num_dma_vecs + total_threads - 1
+                ) // total_threads
+                dma_chunk_i32 = dma_bytes // 4
+                dma_tx_i32_base = tx * arith.constant(dma_chunk_i32, index=True)
+                c_num_dma_vecs = arith.constant(num_dma_vecs, index=True)
                 x_row_base_div4 = []
                 x_col_local_i32 = []
                 x_row_local = []
-                for i in range_constexpr(num_x_loads):
-                    row_local, col_local_i32 = x_tile_chunk_coord_i32(i)
+                dma_slot_valid = []
+                num_x_addr_loads = num_dma_loads if use_async_copy else num_x_loads
+                for i in range_constexpr(num_x_addr_loads):
+                    if const_expr(use_async_copy):
+                        row_local, col_local_i32 = tile_chunk_coord_i32(
+                            arith,
+                            tx_i32_base=dma_tx_i32_base,
+                            i=i,
+                            total_threads=total_threads,
+                            layout_tile_div4=layout_x_tile_div4,
+                            chunk_i32=dma_chunk_i32,
+                        )
+                        global_dma_vec = tx + arith.constant(
+                            i * total_threads, index=True
+                        )
+                        slot_valid = arith.cmpi(
+                            CmpIPredicate.ult, global_dma_vec, c_num_dma_vecs
+                        )
+                        row_for_sort = arith.select(
+                            slot_valid, row_local, arith.constant(0, index=True)
+                        )
+                        dma_slot_valid.append(slot_valid)
+                    else:
+                        row_local, col_local_i32 = x_tile_chunk_coord_i32(i)
+                        row_for_sort = row_local
                     x_row_local.append(row_local)
                     x_col_local_i32.append(col_local_i32)
 
-                    if const_expr(i < num_x_addr_loads):
-                        sorted_row_i = bx_m + row_local
-                        fused_i = buffer_ops.buffer_load(
-                            sorted_rsrc, sorted_row_i, vec_width=1, dtype=T.i32
-                        )
-                        t_i32 = arith.andi(fused_i, mask24)
-                        s_i32 = arith.shrui(fused_i, arith.constant(24))
+                    sorted_row_i = bx_m + row_for_sort
+                    fused_i = buffer_ops.buffer_load(
+                        sorted_rsrc, sorted_row_i, vec_width=1, dtype=T.i32
+                    )
+                    t_i32 = arith.andi(fused_i, mask24)
+                    s_i32 = arith.shrui(fused_i, arith.constant(24))
 
-                        t_valid = arith.cmpi(CmpIPredicate.ult, t_i32, tokens_i32)
-                        s_valid = arith.cmpi(CmpIPredicate.ult, s_i32, topk_i32)
-                        ts_valid = arith.andi(t_valid, s_valid)
-                        t_safe = arith.select(ts_valid, t_i32, arith.constant(0))
-                        s_safe = arith.select(ts_valid, s_i32, arith.constant(0))
-                        row_ts_i32 = t_safe * topk_i32 + s_safe
-                        row_ts_idx = arith.index_cast(T.index, row_ts_i32)
+                    t_valid = arith.cmpi(CmpIPredicate.ult, t_i32, tokens_i32)
+                    s_valid = arith.cmpi(CmpIPredicate.ult, s_i32, topk_i32)
+                    ts_valid = arith.andi(t_valid, s_valid)
+                    t_safe = arith.select(ts_valid, t_i32, arith.constant(0))
+                    s_safe = arith.select(ts_valid, s_i32, arith.constant(0))
+                    row_ts_i32 = t_safe * topk_i32 + s_safe
+                    row_ts_idx = arith.index_cast(T.index, row_ts_i32)
 
-                        x_row_base_div4.append(row_ts_idx * c_k_div4)
-                    else:
-                        x_row_base_div4.append(arith.index(0))
+                    x_row_base_div4.append(row_ts_idx * c_k_div4)
 
                 def load_x_tile(base_k):
                     base_k_div4 = _div_pow2(
@@ -4484,14 +5805,7 @@ def compile_mixed_moe_gemm2_common(
                             )
 
                 if const_expr(use_async_copy):
-                    dma_bytes = 16
                     wave_size = 64
-                    eff_bytes_per_buffer = (
-                        int(tile_m) * int(eff_lds_stride) * int(a_elem_bytes)
-                    )
-                    num_dma_loads = max(
-                        1, eff_bytes_per_buffer // (total_threads * dma_bytes)
-                    )
                     c_a_elem_bytes_dma = arith.constant(int(a_elem_bytes), index=True)
                     c_wave_dma_bytes = arith.constant(wave_size * dma_bytes, index=True)
 
@@ -4530,15 +5844,19 @@ def compile_mixed_moe_gemm2_common(
                             lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
                             lds_ptr = llvm.inttoptr(lds_ptr_type, lds_ptr_i64)
 
-                            rocdl.raw_ptr_buffer_load_lds(
-                                x_rsrc,
-                                lds_ptr,
-                                arith.constant(dma_bytes, type=T.i32),
-                                global_offset,
-                                arith.constant(0, type=T.i32),
-                                arith.constant(0, type=T.i32),
-                                arith.constant(0, type=T.i32),
+                            slot_if = scf.IfOp(
+                                dma_slot_valid[i], results_=[], has_else=False
                             )
+                            with _if_then(slot_if):
+                                rocdl.raw_ptr_buffer_load_lds(
+                                    x_rsrc,
+                                    lds_ptr,
+                                    arith.constant(dma_bytes, type=T.i32),
+                                    global_offset,
+                                    arith.constant(0, type=T.i32),
+                                    arith.constant(0, type=T.i32),
+                                    arith.constant(0, type=T.i32),
+                                )
 
                     def prefetch_x_to_lds(base_k, lds_base):
                         dma_x_tile_to_lds(base_k, lds_base)

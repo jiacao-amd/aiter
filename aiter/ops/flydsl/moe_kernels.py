@@ -629,7 +629,32 @@ def compile_flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
+    block_waves: int | None = None,
     v2_output_layout: bool = False,
+    a_source_bf16: bool = False,
+    bf16_load_ahead: bool = False,
+    mask_padded_a: bool = False,
+    sort_block_m: int = 0,
+    kimi_shared_bf16: bool = False,
+    kimi_shared_weight_layout: str = "preshuffled",
+    kimi_shared_b_cache_mod: int | None = None,
+    kimi_shared_wave_local_wait: bool = False,
+    kimi_shared_pipeline_wait: str = "default",
+    kimi_shared_start_sleep: int = 0,
+    kimi_routed_late_a1: bool = False,
+    kimi_routed_a_ring2: bool = False,
+    kimi_routed_b_ring4: bool = False,
+    kimi_routed_b_early4: bool = False,
+    kimi_routed_b_half_carry: bool = False,
+    kimi_routed_priority3: bool = False,
+    kimi_shared_wg_schedule: str = "prefix",
+    kimi_shared_grid_split_k: int = 1,
+    kimi_shared_grid_tile_n: int = 32,
+    kimi_shared_grid_n_major: bool = False,
+    kimi_shared_fused_reduce: bool = False,
+    kimi_shared_identity_m_indices: bool = False,
+    kimi_shared_a_lds_swizzle: bool = False,
+    kimi_shared_vec2_partials: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W): build the ported gemm1
@@ -689,7 +714,32 @@ def compile_flydsl_moe_stage1(
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
             k_wave=k_wave,
+            block_waves=block_waves,
             v2_output_layout=v2_output_layout,
+            a_source_bf16=a_source_bf16,
+            bf16_load_ahead=bf16_load_ahead,
+            mask_padded_a=mask_padded_a,
+            sort_block_m=sort_block_m,
+            kimi_shared_bf16=kimi_shared_bf16,
+            kimi_shared_weight_layout=kimi_shared_weight_layout,
+            kimi_shared_b_cache_mod=kimi_shared_b_cache_mod,
+            kimi_shared_wave_local_wait=kimi_shared_wave_local_wait,
+            kimi_shared_pipeline_wait=kimi_shared_pipeline_wait,
+            kimi_shared_start_sleep=kimi_shared_start_sleep,
+            kimi_routed_late_a1=kimi_routed_late_a1,
+            kimi_routed_a_ring2=kimi_routed_a_ring2,
+            kimi_routed_b_ring4=kimi_routed_b_ring4,
+            kimi_routed_b_early4=kimi_routed_b_early4,
+            kimi_routed_b_half_carry=kimi_routed_b_half_carry,
+            kimi_routed_priority3=kimi_routed_priority3,
+            kimi_shared_wg_schedule=kimi_shared_wg_schedule,
+            kimi_shared_grid_split_k=kimi_shared_grid_split_k,
+            kimi_shared_grid_tile_n=kimi_shared_grid_tile_n,
+            kimi_shared_grid_n_major=kimi_shared_grid_n_major,
+            kimi_shared_fused_reduce=kimi_shared_fused_reduce,
+            kimi_shared_identity_m_indices=kimi_shared_identity_m_indices,
+            kimi_shared_a_lds_swizzle=kimi_shared_a_lds_swizzle,
+            kimi_shared_vec2_partials=kimi_shared_vec2_partials,
         )
     else:
         raise ValueError(
@@ -1457,6 +1507,10 @@ def _flydsl_moe_stage1_impl(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    a_source_bf16: bool = False,
+    bf16_load_ahead: bool = False,
+    mask_padded_a: bool = False,
+    sort_block_m: int = 0,
     _compile_kernel=compile_flydsl_moe_stage1,
     _build_mx_args=_s1_args_fp4,
 ):
@@ -1494,6 +1548,13 @@ def _flydsl_moe_stage1_impl(
     if a_dtype == "fp4":
         model_dim = model_dim * 2
 
+    _sort_block_m = tile_m if sort_block_m <= 0 else sort_block_m
+    if _sort_block_m != tile_m and _sort_block_m % tile_m != 0:
+        raise ValueError(
+            f"sort_block_m ({_sort_block_m}) must be a multiple of "
+            f"tile_m ({tile_m})"
+        )
+
     _need_fp4 = out_dtype == "fp4"
     _need_fp8 = out_dtype == "fp8"
     _fuse_any_quant = _need_fp4 or _need_fp8
@@ -1509,7 +1570,7 @@ def _flydsl_moe_stage1_impl(
     _is_splitk = k_batch > 1
     gate_up_interleave = gate_mode == "interleave"
 
-    _v2_output_layout = _fuse_any_quant and not _is_splitk and v2_output_layout
+    _v2_output_layout = not _is_splitk and v2_output_layout
 
     dev = a.device
     # a16w-mix ported gemm1: bf16 A x {mxfp4 (a16w4), int4 (a16wi4)} W -> bf16 sorted
@@ -1523,7 +1584,7 @@ def _flydsl_moe_stage1_impl(
         from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm1
 
         _act = "situv2" if act in ("situv2", "situ") else act
-        sorted_size = int(sorted_expert_ids.shape[0]) * int(tile_m)
+        sorted_size = int(sorted_expert_ids.shape[0]) * int(_sort_block_m)
         _alloc = torch.zeros if inter_dim_pad > 0 else torch.empty
         inter_sorted = _alloc(sorted_size, inter_dim, dtype=torch.bfloat16, device=dev)
         flydsl_a16w4_gemm1(
@@ -1575,15 +1636,20 @@ def _flydsl_moe_stage1_impl(
     if out is None:
         if _v2_output_layout:
             _sorted_rows = max(
-                sorted_token_ids.shape[0], sorted_expert_ids.shape[0] * tile_m
+                sorted_token_ids.shape[0],
+                sorted_expert_ids.shape[0] * _sort_block_m,
             )
             if _need_fp4:
                 out = torch.empty(
                     (_sorted_rows, inter_dim // 2), dtype=dtypes.fp4x2, device=dev
                 )
-            else:
+            elif _need_fp8:
                 out = torch.empty(
                     (_sorted_rows, inter_dim), dtype=dtypes.fp8, device=dev
+                )
+            else:
+                out = torch.empty(
+                    (_sorted_rows, inter_dim), dtype=torch_out_dtype, device=dev
                 )
         elif _need_fp4 or (_gui_sk_fused and _need_fp4):
             out = torch.empty(
@@ -1621,7 +1687,6 @@ def _flydsl_moe_stage1_impl(
     _need_quant = _fuse_any_quant or _splitk_fp4 or _gui_sk_fused
     _need_sort = _need_quant
 
-    _sort_block_m = tile_m
     _all_blks = sorted_expert_ids.shape[0]
     _dense_blks = (
         min(token_num * topk * _sort_block_m, sorted_token_ids.shape[0])
@@ -1733,7 +1798,14 @@ def _flydsl_moe_stage1_impl(
         "a_scale_one": a_scale_one,
         "xcd_swizzle": xcd_swizzle,
         "k_wave": k_wave,
+        "sort_block_m": _sort_block_m,
     }
+    if a_source_bf16:
+        compile_kwargs["a_source_bf16"] = True
+    if bf16_load_ahead:
+        compile_kwargs["bf16_load_ahead"] = True
+    if mask_padded_a:
+        compile_kwargs["mask_padded_a"] = True
     # The injected FHMoE compiler does not implement the v2 sorted-row layout.
     if _v2_output_layout:
         compile_kwargs["v2_output_layout"] = True
@@ -1918,6 +1990,10 @@ def flydsl_moe_stage1(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    a_source_bf16: bool = False,
+    bf16_load_ahead: bool = False,
+    mask_padded_a: bool = False,
+    sort_block_m: int = 0,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -1975,6 +2051,10 @@ def flydsl_moe_stage1(
         swiglu_limit=swiglu_limit,
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
+        a_source_bf16=a_source_bf16,
+        bf16_load_ahead=bf16_load_ahead,
+        mask_padded_a=mask_padded_a,
+        sort_block_m=sort_block_m,
     )
 
 

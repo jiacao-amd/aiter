@@ -18,6 +18,7 @@ router weights, while the shared branch directly stores its dense result.
 """
 
 import functools
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -31,7 +32,7 @@ from aiter.ops.flydsl.kernels.mxfp4_gemm_common import lds_typed_ptr, lds_vec_lo
 from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 
 from .moe_2stage_a16wmix.gemm1 import _gemm1_body_a16w4
-from .moe_2stage_a16wmix.gemm2 import _gemm2_body_a16w4
+from .moe_2stage_a16wmix.gemm2 import _gemm2_body_a16w4, _wait_lds_barrier
 from .moe_2stage_a16wmix.utils import (
     _global_i32_at,
     _mma_bf16,
@@ -46,6 +47,121 @@ KIMI_K3_SHARED_HIDDEN = 7168
 KIMI_K3_ROUTED_INTER = 384
 KIMI_K3_SHARED_INTER = 768
 KIMI_K3_TOPK = 16
+KIMI_K3_STAGE2_WIDE_N_8WAVE_ENV = "AITER_KIMI_K3_STAGE2_WIDE_N_8WAVE"
+KIMI_K3_STAGE2_WIDE_N_8WAVE_OVERRIDE = "stage2_wide_n_8wave"
+KIMI_K3_STAGE2_SPLIT_PATHS_ENV = "AITER_KIMI_K3_STAGE2_SPLIT_PATHS"
+KIMI_K3_STAGE2_SPLIT_PATHS_OVERRIDE = "stage2_split_paths"
+KIMI_K3_STAGE2_ROUTED_M8_EPILOGUE_ENV = (
+    "AITER_KIMI_K3_STAGE2_ROUTED_M8_EPILOGUE"
+)
+KIMI_K3_STAGE2_ROUTED_M8_META_BROADCAST_ENV = (
+    "AITER_KIMI_K3_STAGE2_ROUTED_M8_META_BROADCAST"
+)
+KIMI_K3_STAGE2_ROUTED_M8_REGISTER_EPILOGUE_ENV = (
+    "AITER_KIMI_K3_STAGE2_ROUTED_M8_REGISTER_EPILOGUE"
+)
+
+
+def kimi_k3_stage2_wide_n_8wave_enabled() -> bool:
+    """Return whether the opt-in 512-thread Stage2 wide-N kernel is enabled."""
+    value = os.environ.get(KIMI_K3_STAGE2_WIDE_N_8WAVE_ENV)
+    if value is None:
+        overrides = {
+            item.strip()
+            for item in os.environ.get(
+                "AITER_KIMI_K3_PROFILE_OVERRIDES", ""
+            ).split(",")
+            if item.strip()
+        }
+        return KIMI_K3_STAGE2_WIDE_N_8WAVE_OVERRIDE in overrides
+    value = value.strip().lower()
+    if value in ("", "0", "false", "off", "no"):
+        return False
+    if value in ("1", "true", "on", "yes"):
+        return True
+    raise ValueError(
+        f"{KIMI_K3_STAGE2_WIDE_N_8WAVE_ENV} must be a boolean, got {value!r}"
+    )
+
+
+def kimi_k3_stage2_split_paths_enabled() -> bool:
+    """Return whether Stage2 uses separate routed/shared serial launches."""
+    value = os.environ.get(KIMI_K3_STAGE2_SPLIT_PATHS_ENV)
+    if value is None or not value.strip():
+        overrides = {
+            item.strip()
+            for item in os.environ.get(
+                "AITER_KIMI_K3_PROFILE_OVERRIDES", ""
+            ).split(",")
+            if item.strip()
+        }
+        return KIMI_K3_STAGE2_SPLIT_PATHS_OVERRIDE in overrides
+    value = value.strip().lower()
+    if value in ("0", "false", "off", "no"):
+        return False
+    if value in ("1", "true", "on", "yes"):
+        return True
+    raise ValueError(
+        f"{KIMI_K3_STAGE2_SPLIT_PATHS_ENV} must be a boolean, got {value!r}"
+    )
+
+
+def kimi_k3_stage2_routed_m8_epilogue_enabled() -> bool:
+    """Return whether the opt-in M<=8 routed Stage2 epilogue is enabled."""
+    value = os.environ.get(KIMI_K3_STAGE2_ROUTED_M8_EPILOGUE_ENV, "0")
+    value = value.strip().lower()
+    if value in ("", "0", "false", "off", "no"):
+        return False
+    if value in ("1", "true", "on", "yes"):
+        return True
+    raise ValueError(
+        f"{KIMI_K3_STAGE2_ROUTED_M8_EPILOGUE_ENV} must be a boolean, "
+        f"got {value!r}"
+    )
+
+
+def kimi_k3_stage2_routed_m8_meta_broadcast_enabled() -> bool:
+    """Return whether M<=8 Stage2 broadcasts routed metadata within a wave."""
+    value = os.environ.get(KIMI_K3_STAGE2_ROUTED_M8_META_BROADCAST_ENV, "0")
+    value = value.strip().lower()
+    if value in ("", "0", "false", "off", "no"):
+        return False
+    if value in ("1", "true", "on", "yes"):
+        return True
+    raise ValueError(
+        f"{KIMI_K3_STAGE2_ROUTED_M8_META_BROADCAST_ENV} must be a boolean, "
+        f"got {value!r}"
+    )
+
+
+def kimi_k3_stage2_routed_m8_register_epilogue_enabled() -> bool:
+    """Return whether the opt-in M<=8 register/DPP epilogue is enabled."""
+    value = os.environ.get(KIMI_K3_STAGE2_ROUTED_M8_REGISTER_EPILOGUE_ENV, "0")
+    value = value.strip().lower()
+    if value in ("", "0", "false", "off", "no"):
+        return False
+    if value in ("1", "true", "on", "yes"):
+        return True
+    raise ValueError(
+        f"{KIMI_K3_STAGE2_ROUTED_M8_REGISTER_EPILOGUE_ENV} must be a boolean, "
+        f"got {value!r}"
+    )
+
+
+def _cache_mod_from_env(name: str, default: int) -> int:
+    """Resolve an optional AMDGPU cache modifier without changing defaults."""
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        cache_mod = int(value)
+    except ValueError as error:
+        raise ValueError(
+            f"{name} must be 0, 1, 2, or 3; got {value!r}"
+        ) from error
+    if cache_mod not in (0, 1, 2, 3):
+        raise ValueError(f"{name} must be 0, 1, 2, or 3; got {cache_mod}")
+    return cache_mod
 
 
 @flyc.jit
@@ -61,11 +177,14 @@ def _direct_bf16_epilog(
     BM,
     N_OUT,
     BN,
+    num_waves=4,
 ):
     """Store one dense GEMM tile without routing weights or atomics."""
     m_chunks = BM // 16
-    m_reps = BM // 8
-    n_per_wave = BN // 4
+    rows_per_pass = 2 * num_waves
+    assert BM % rows_per_pass == 0
+    m_reps = BM // rows_per_pass
+    n_per_wave = BN // num_waves
     num_acc_n = n_per_wave // 16
     store_steps = BN // 64
     lane_div_16 = lane // fx.Int32(16)
@@ -94,7 +213,7 @@ def _direct_bf16_epilog(
     gpu.barrier()
 
     for mr in range_constexpr(m_reps):
-        row = fx.Int32(mr * 8) + m_lane
+        row = fx.Int32(mr * rows_per_pass) + m_lane
         valid = row < i32_M
         row_base_addr = row * fx.Int32(N_OUT) + n_block_idx * fx.Int32(BN) + col_start
         for s in range_constexpr(store_steps):
@@ -136,15 +255,34 @@ def _gemm2_body_a16w16_direct(
     use_k16=False,
     shared_weight_layout="preshuffled",
     rowmajor_b_to_lds=False,
+    double_buffer=False,
+    num_waves=4,
 ):
     """Dense BF16 stage2 body used by the Kimi shared experts."""
     elem_bytes = 2
     kh_tile_bytes = TILE_K * elem_bytes
     lds_stride = TILE_K
     k_tiles_total = INTER // TILE_K
+    # Kimi-K3 shared stage2 has six K128 tiles at decode BM16. Keep this
+    # candidate scoped to the direct-B path; B-in-LDS needs a separate arena
+    # layout before it can share the second A slot.
+    _PIPE = (
+        double_buffer
+        and not use_k16
+        and not rowmajor_b_to_lds
+        and BM == 16
+        and TILE_N // num_waves == 16
+        and TILE_K == 128
+        and k_tiles_total == 6
+    )
+    A_LDS_STAGES = 2 if _PIPE else 1
+    A_SLOT_BYTES = BM * kh_tile_bytes
     m_repeat = BM // 16
     k_unroll = kh_tile_bytes // 64
-    n_per_wave = TILE_N // 4
+    assert num_waves in (4, 8)
+    assert TILE_N % num_waves == 0
+    n_per_wave = TILE_N // num_waves
+    assert n_per_wave >= 16 and n_per_wave % 16 == 0
     num_acc_n = n_per_wave // 16
     k_blocks16 = kh_tile_bytes // 16
 
@@ -179,7 +317,7 @@ def _gemm2_body_a16w16_direct(
     c_k_div4 = (INTER * elem_bytes) // 4
     a_loader = make_a_loader(
         lds_raw_ptr,
-        num_i32=BM * lds_stride // 2,
+        num_i32=A_LDS_STAGES * BM * lds_stride // 2,
         BM=BM,
         TILE_K=TILE_K,
         KH_TILE_BYTES=kh_tile_bytes,
@@ -193,6 +331,9 @@ def _gemm2_body_a16w16_direct(
         row_base_dwords=lambda row_local: row_local * fx.Int32(c_k_div4),
         dma_cache_mod=b_cache_mod,
         dma_via_vgpr=use_k16,
+        k_grp_base_bytes=fx.Int32(0) if _PIPE else None,
+        A_SLOT_BYTES=A_SLOT_BYTES,
+        active_load_threads=256 if num_waves == 8 else None,
     )
 
     n_tile_base = wave * fx.Int32(n_per_wave)
@@ -285,25 +426,66 @@ def _gemm2_body_a16w16_direct(
         mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16))
     mma = functools.partial(_mma_bf16, mma_atom, use_k16)
 
-    for kt in range_constexpr(k_tiles_total):
-        base_k = fx.Int32(kt * TILE_K)
-        a_loader.store_tile(base_k)
-        if const_expr(rowmajor_b_to_lds):
-            stage_rowmajor_b(base_k)
-        else:
-            b_raw = [b_loader.load_raw(base_k, col) for col in cols]
-            b_scale = [b_loader.load_scale(base_k, col) for col in cols]
-        gpu.barrier()
+    def load_b_tile(base_k):
+        b_raw = [b_loader.load_raw(base_k, col) for col in cols]
+        b_scale = [b_loader.load_scale(base_k, col) for col in cols]
+        return b_raw, b_scale
+
+    def preload_a(read_slot):
+        return [
+            [a_loader.load(mi, ku, slot=read_slot) for ku in range_constexpr(k_unroll)]
+            for mi in range_constexpr(m_repeat)
+        ]
+
+    def compute_tile(b_tile, a_frags):
+        b_raw, b_scale = b_tile
         for ni in range_constexpr(num_acc_n):
             for ku in range_constexpr(k_unroll):
-                if const_expr(rowmajor_b_to_lds):
-                    bb = load_rowmajor_b(ni, ku)
-                else:
-                    bb = b_loader.upconvert(b_raw[ni], ku, b_scale[ni][ku])
+                bb = b_loader.upconvert(b_raw[ni], ku, b_scale[ni][ku])
                 for mi in range_constexpr(m_repeat):
-                    aa = a_loader.load(mi, ku)
-                    mma(accm[mi][ni], aa, bb)
-        gpu.barrier()
+                    mma(accm[mi][ni], a_frags[mi][ku], bb)
+
+    def issue_a_tile(base_k, slot):
+        rocdl.sched_barrier(0)
+        a_loader.store_tile(base_k, slot=slot)
+        rocdl.sched_barrier(0)
+
+    if const_expr(not _PIPE):
+        for kt in range_constexpr(k_tiles_total):
+            base_k = fx.Int32(kt * TILE_K)
+            a_loader.store_tile(base_k)
+            if const_expr(rowmajor_b_to_lds):
+                stage_rowmajor_b(base_k)
+            else:
+                b_raw = [b_loader.load_raw(base_k, col) for col in cols]
+                b_scale = [b_loader.load_scale(base_k, col) for col in cols]
+            gpu.barrier()
+            for ni in range_constexpr(num_acc_n):
+                for ku in range_constexpr(k_unroll):
+                    if const_expr(rowmajor_b_to_lds):
+                        bb = load_rowmajor_b(ni, ku)
+                    else:
+                        bb = b_loader.upconvert(b_raw[ni], ku, b_scale[ni][ku])
+                    for mi in range_constexpr(m_repeat):
+                        aa = a_loader.load(mi, ku)
+                        mma(accm[mi][ni], aa, bb)
+            gpu.barrier()
+    else:
+        # One BF16 dwordx4 load per K32 fragment; scales are compile-time None.
+        B_VMEM_LOADS_PER_TILE = num_acc_n * k_unroll
+        issue_a_tile(fx.Int32(0), 0)
+        b_cur = load_b_tile(fx.Int32(0))
+        for kt in range_constexpr(k_tiles_total):
+            cur_slot = kt % A_LDS_STAGES
+            _wait_lds_barrier(B_VMEM_LOADS_PER_TILE)
+            a_frags = preload_a(cur_slot)
+            if const_expr(kt + 1 < k_tiles_total):
+                next_k = fx.Int32((kt + 1) * TILE_K)
+                issue_a_tile(next_k, (kt + 1) % A_LDS_STAGES)
+                b_nxt = load_b_tile(next_k)
+            compute_tile(b_cur, a_frags)
+            if const_expr(kt + 1 < k_tiles_total):
+                b_cur = b_nxt
 
     gpu.barrier()
     lds_acc_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
@@ -322,6 +504,7 @@ def _gemm2_body_a16w16_direct(
         BM=BM,
         N_OUT=N_OUT,
         BN=TILE_N,
+        num_waves=num_waves,
     )
 
 
@@ -344,11 +527,13 @@ def compile_kimi_k3_fhmoe_stage1(
     shared_tile_k=None,
     shared_k_wave=None,
     shared_first=False,
+    path="both",
 ):
     """Compile the unified routed-MXFP4/shared-BF16 Kimi stage1 launch."""
     assert BM in (16, 32), f"Kimi stage1 compute BM must be 16 or 32, got {BM}"
     assert SORT_BM == 32, f"Kimi stage1 sorting BM must stay 32, got {SORT_BM}"
     assert BM <= SORT_BM
+    assert path in ("both", "routed", "shared")
     assert KIMI_K3_ROUTED_INTER % TILE_N == 0
     assert KIMI_K3_SHARED_INTER % TILE_N == 0
     assert KIMI_K3_ROUTED_HIDDEN % TILE_K == 0
@@ -400,7 +585,12 @@ def compile_kimi_k3_fhmoe_stage1(
         shared_lds_bytes = max(shared_a_lds_bytes, shared_reduce_bytes)
     else:
         shared_lds_bytes = shared_a_lds_bytes
-    lds_bytes = max(routed_lds_bytes, shared_lds_bytes)
+    if path == "routed":
+        lds_bytes = routed_lds_bytes
+    elif path == "shared":
+        lds_bytes = shared_lds_bytes
+    else:
+        lds_bytes = max(routed_lds_bytes, shared_lds_bytes)
 
     @fx.struct
     class SharedStorage:
@@ -414,6 +604,7 @@ def compile_kimi_k3_fhmoe_stage1(
             f"_rxcd{routed_xcd_swizzle}_rkw{routed_k_wave}"
             f"_stn{shared_tile_n}_stk{shared_tile_k}_skw{shared_k_wave}"
             f"_sf{int(shared_first)}"
+            f"_path{path}"
         ),
         known_block_size=[256, 1, 1],
     )
@@ -444,34 +635,16 @@ def compile_kimi_k3_fhmoe_stage1(
         lane = tx_i32 % fx.Int32(64)
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
 
-        routed_blocks = _global_i32_at(
-            arg_routed_cumsum, fx.Int32(0)
-        ) // fx.Int32(SORT_BM)
-        routed_bound = routed_blocks * fx.Int32(routed_n_blocks)
-        dispatch_bx = bx_i32
-        if const_expr(shared_first):
-            is_shared = bx_i32 < fx.Int32(shared_grid)
-            shifted_bx = bx_i32 - fx.Int32(shared_grid)
-            is_routed = shifted_bx < routed_bound
-            dispatch_bx = is_shared.select(
-                routed_bound + bx_i32,
-                is_routed.select(
-                    shifted_bx,
-                    routed_bound + fx.Int32(shared_grid),
-                ),
-            )
-
-        if dispatch_bx < routed_bound:
-            routed_bx = dispatch_bx
+        def run_routed(routed_bx, routed_bound):
             if const_expr(routed_xcd_swizzle > 0):
                 nxcd = 8
                 xq = _udiv(routed_bound, nxcd)
                 xr = _umod(routed_bound, nxcd)
-                xc = _umod(dispatch_bx, nxcd)
+                xc = _umod(routed_bx, nxcd)
                 wgid = (
                     xc * xq
                     + fx.Int32(arith.minsi(_raw(xc), _raw(xr)))
-                    + _udiv(dispatch_bx, nxcd)
+                    + _udiv(routed_bx, nxcd)
                 )
                 ng = fx.Int32(routed_xcd_swizzle * routed_n_blocks)
                 group_id = wgid // ng
@@ -522,49 +695,76 @@ def compile_kimi_k3_fhmoe_stage1(
                 k_wave=routed_k_wave,
                 use_k16=use_k16,
             )
+
+        def run_shared(shared_bx):
+            situ = situ_params(
+                fx.Float32(f32_situ_beta),
+                fx.Float32(f32_situ_beta_rcp),
+                fx.Float32(f32_situ_linbeta),
+                fx.Float32(f32_situ_linbeta_rcp),
+                fx.Float32(f32_swiglu_limit),
+            )
+            _gemm1_body_a16w4(
+                lds_raw_ptr,
+                arg_shared_x,
+                arg_shared_w1,
+                arg_shared_w1,
+                arg_shared_eids,
+                arg_shared_mind,
+                arg_shared_cumsum,
+                arg_shared_inter,
+                shared_bx,
+                lane,
+                wave,
+                i32_M,
+                situ,
+                BM=BM,
+                SORT_BM=SORT_BM,
+                TILE_N=shared_tile_n,
+                TILE_K=shared_tile_k,
+                K=KIMI_K3_SHARED_HIDDEN,
+                INTER=KIMI_K3_SHARED_INTER,
+                NE=1,
+                TOPK=1,
+                act="situv2",
+                b_cache_mod=shared_b_cache_mod,
+                w_dtype="bf16",
+                w_layout=(
+                    "rowmajor" if shared_weight_layout == "rowmajor" else "standard"
+                ),
+                k_wave=shared_k_wave,
+                use_k16=use_k16,
+            )
+
+        if const_expr(path == "shared"):
+            run_shared(bx_i32)
         else:
-            shared_bx = dispatch_bx - routed_bound
-            if shared_bx < fx.Int32(shared_grid):
-                situ = situ_params(
-                    fx.Float32(f32_situ_beta),
-                    fx.Float32(f32_situ_beta_rcp),
-                    fx.Float32(f32_situ_linbeta),
-                    fx.Float32(f32_situ_linbeta_rcp),
-                    fx.Float32(f32_swiglu_limit),
-                )
-                _gemm1_body_a16w4(
-                    lds_raw_ptr,
-                    arg_shared_x,
-                    arg_shared_w1,
-                    arg_shared_w1,
-                    arg_shared_eids,
-                    arg_shared_mind,
-                    arg_shared_cumsum,
-                    arg_shared_inter,
-                    shared_bx,
-                    lane,
-                    wave,
-                    i32_M,
-                    situ,
-                    BM=BM,
-                    SORT_BM=SORT_BM,
-                    TILE_N=shared_tile_n,
-                    TILE_K=shared_tile_k,
-                    K=KIMI_K3_SHARED_HIDDEN,
-                    INTER=KIMI_K3_SHARED_INTER,
-                    NE=1,
-                    TOPK=1,
-                    act="situv2",
-                    b_cache_mod=shared_b_cache_mod,
-                    w_dtype="bf16",
-                    w_layout=(
-                        "rowmajor"
-                        if shared_weight_layout == "rowmajor"
-                        else "standard"
-                    ),
-                    k_wave=shared_k_wave,
-                    use_k16=use_k16,
-                )
+            routed_blocks = _global_i32_at(
+                arg_routed_cumsum, fx.Int32(0)
+            ) // fx.Int32(SORT_BM)
+            routed_bound = routed_blocks * fx.Int32(routed_n_blocks)
+            if const_expr(path == "routed"):
+                if bx_i32 < routed_bound:
+                    run_routed(bx_i32, routed_bound)
+            else:
+                dispatch_bx = bx_i32
+                if const_expr(shared_first):
+                    is_shared = bx_i32 < fx.Int32(shared_grid)
+                    shifted_bx = bx_i32 - fx.Int32(shared_grid)
+                    is_routed = shifted_bx < routed_bound
+                    dispatch_bx = is_shared.select(
+                        routed_bound + bx_i32,
+                        is_routed.select(
+                            shifted_bx,
+                            routed_bound + fx.Int32(shared_grid),
+                        ),
+                    )
+                if dispatch_bx < routed_bound:
+                    run_routed(dispatch_bx, routed_bound)
+                else:
+                    shared_bx = dispatch_bx - routed_bound
+                    if shared_bx < fx.Int32(shared_grid):
+                        run_shared(shared_bx)
 
     @flyc.jit
     def launch(
@@ -620,7 +820,6 @@ def compile_kimi_k3_fhmoe_stage1(
     return launch
 
 
-@functools.cache
 def compile_kimi_k3_fhmoe_stage2(
     *,
     NE,
@@ -635,15 +834,106 @@ def compile_kimi_k3_fhmoe_stage2(
     shared_weight_layout="preshuffled",
     routed_xcd_swizzle=0,
     routed_persist=False,
+    routed_valid_m_cap=0,
     shared_tile_n=None,
     shared_tile_k=None,
     shared_rowmajor_b_to_lds=False,
     shared_first=False,
+    path="both",
+    routed_route_output=False,
+):
+    """Resolve Stage2 tuning gates before entering the compile cache."""
+    stage2_double_buffer = (
+        os.environ.get("AITER_KIMI_K3_STAGE2_DOUBLE_BUFFER", "0") == "1"
+    )
+    stage2_wide_n_8wave = kimi_k3_stage2_wide_n_8wave_enabled()
+    stage2_split_paths = kimi_k3_stage2_split_paths_enabled()
+    stage2_routed_m8_meta_broadcast = (
+        routed_valid_m_cap == 8
+        and kimi_k3_stage2_routed_m8_meta_broadcast_enabled()
+    )
+    stage2_routed_m8_register_epilogue = (
+        routed_valid_m_cap == 8
+        and not routed_route_output
+        and kimi_k3_stage2_routed_m8_register_epilogue_enabled()
+    )
+    routed_b_cache_mod = _cache_mod_from_env(
+        "AITER_KIMI_K3_STAGE2_ROUTED_B_CACHE_MOD", routed_b_cache_mod
+    )
+    shared_b_cache_mod = _cache_mod_from_env(
+        "AITER_KIMI_K3_STAGE2_SHARED_B_CACHE_MOD", shared_b_cache_mod
+    )
+    return _compile_kimi_k3_fhmoe_stage2(
+        NE=NE,
+        BM=BM,
+        SORT_BM=SORT_BM,
+        TILE_N=TILE_N,
+        TILE_K=TILE_K,
+        routed_b_cache_mod=routed_b_cache_mod,
+        shared_b_cache_mod=shared_b_cache_mod,
+        waves_per_eu=waves_per_eu,
+        use_k16=use_k16,
+        shared_weight_layout=shared_weight_layout,
+        routed_xcd_swizzle=routed_xcd_swizzle,
+        routed_persist=routed_persist,
+        routed_valid_m_cap=routed_valid_m_cap,
+        shared_tile_n=shared_tile_n,
+        shared_tile_k=shared_tile_k,
+        shared_rowmajor_b_to_lds=shared_rowmajor_b_to_lds,
+        shared_first=shared_first,
+        path=path,
+        stage2_double_buffer=stage2_double_buffer,
+        stage2_wide_n_8wave=stage2_wide_n_8wave,
+        stage2_split_paths=stage2_split_paths,
+        stage2_routed_m8_meta_broadcast=stage2_routed_m8_meta_broadcast,
+        stage2_routed_m8_register_epilogue=stage2_routed_m8_register_epilogue,
+        routed_route_output=routed_route_output,
+    )
+
+
+@functools.cache
+def _compile_kimi_k3_fhmoe_stage2(
+    *,
+    NE,
+    BM=32,
+    SORT_BM=32,
+    TILE_N=128,
+    TILE_K=128,
+    routed_b_cache_mod=0,
+    shared_b_cache_mod=0,
+    waves_per_eu=None,
+    use_k16=False,
+    shared_weight_layout="preshuffled",
+    routed_xcd_swizzle=0,
+    routed_persist=False,
+    routed_valid_m_cap=0,
+    shared_tile_n=None,
+    shared_tile_k=None,
+    shared_rowmajor_b_to_lds=False,
+    shared_first=False,
+    path="both",
+    stage2_double_buffer=False,
+    stage2_wide_n_8wave=False,
+    stage2_split_paths=False,
+    stage2_routed_m8_meta_broadcast=False,
+    stage2_routed_m8_register_epilogue=False,
+    routed_route_output=False,
 ):
     """Compile the unified routed-MXFP4/shared-BF16 Kimi stage2 launch."""
     assert BM in (16, 32), f"Kimi stage2 compute BM must be 16 or 32, got {BM}"
     assert SORT_BM == 32, f"Kimi stage2 sorting BM must stay 32, got {SORT_BM}"
     assert BM <= SORT_BM
+    assert path in ("both", "routed", "shared")
+    assert isinstance(stage2_double_buffer, bool)
+    assert isinstance(stage2_wide_n_8wave, bool)
+    assert isinstance(stage2_split_paths, bool)
+    assert isinstance(stage2_routed_m8_meta_broadcast, bool)
+    assert isinstance(stage2_routed_m8_register_epilogue, bool)
+    assert isinstance(routed_route_output, bool)
+    assert routed_valid_m_cap in (0, 8)
+    assert not stage2_split_paths or path != "both", (
+        "Stage2 split-paths kernels must select routed or shared"
+    )
     assert KIMI_K3_ROUTED_HIDDEN % TILE_N == 0
     assert KIMI_K3_SHARED_HIDDEN % TILE_N == 0
     assert KIMI_K3_ROUTED_INTER % TILE_K == 0
@@ -651,11 +941,62 @@ def compile_kimi_k3_fhmoe_stage2(
     assert shared_weight_layout in ("preshuffled", "rowmajor")
     shared_tile_n = TILE_N if shared_tile_n is None else shared_tile_n
     shared_tile_k = TILE_K if shared_tile_k is None else shared_tile_k
+    num_waves = 8 if stage2_wide_n_8wave else 4
+    if routed_valid_m_cap == 8:
+        assert BM == 16, "M<=8 routed epilogue requires BM16"
+        assert num_waves == 4, "M<=8 routed epilogue requires the 4-wave kernel"
+    if stage2_routed_m8_meta_broadcast:
+        assert routed_valid_m_cap == 8, (
+            "M<=8 metadata broadcast requires the M<=8 routed epilogue"
+        )
+    if stage2_routed_m8_register_epilogue:
+        assert routed_valid_m_cap == 8, (
+            "M<=8 register epilogue requires the M<=8 routed epilogue"
+        )
+        assert path != "shared", "M<=8 register epilogue requires a routed path"
+        assert not use_k16, "M<=8 register epilogue is supported only on gfx950"
+        assert BM == 16, "M<=8 register epilogue requires BM16"
+        assert TILE_N == 128, "M<=8 register epilogue requires routed TILE_N=128"
+        assert TILE_K == 128, "M<=8 register epilogue requires routed TILE_K=128"
+        assert num_waves == 4, "M<=8 register epilogue requires four waves"
+        assert shared_weight_layout == "rowmajor", (
+            "M<=8 register epilogue prototype requires row-major shared weights"
+        )
+        assert shared_tile_n == 64 and shared_tile_k == 128, (
+            "M<=8 register epilogue prototype requires shared TILE_N/TILE_K=64/128"
+        )
+        assert not shared_rowmajor_b_to_lds and shared_first, (
+            "M<=8 register epilogue prototype requires the direct row-major "
+            "shared-B path with shared-first scheduling"
+        )
+    if routed_route_output:
+        assert path != "shared", "route-output Stage2 requires a routed path"
+        assert routed_valid_m_cap == 8, "route-output Stage2 is scoped to M<=8"
+        assert not use_k16, "route-output Stage2 is supported only on gfx950"
+        assert BM == 16, "route-output Stage2 requires BM16"
+        assert num_waves == 4, "route-output Stage2 requires four waves"
+        assert not stage2_routed_m8_register_epilogue, (
+            "route-output Stage2 uses the LDS-backed direct-store epilogue"
+        )
+    if stage2_wide_n_8wave:
+        assert not use_k16, "Stage2 wide-N/8-wave is supported only on gfx950"
+        assert TILE_N == 256, (
+            "Stage2 wide-N/8-wave requires routed TILE_N=256, got "
+            f"{TILE_N}"
+        )
+        assert shared_tile_n == 128, (
+            "Stage2 wide-N/8-wave requires shared_tile_n=128, got "
+            f"{shared_tile_n}"
+        )
+        assert not shared_rowmajor_b_to_lds, (
+            "Stage2 wide-N/8-wave currently supports only the direct shared-B path"
+        )
     assert KIMI_K3_SHARED_HIDDEN % shared_tile_n == 0
     assert KIMI_K3_SHARED_INTER % shared_tile_k == 0
-    assert shared_tile_n >= 64 and shared_tile_n % 64 == 0, (
-        "shared stage2 splits N across four waves, so shared_tile_n must be a "
-        f"positive multiple of 64, got {shared_tile_n}"
+    shared_wave_tile = num_waves * 16
+    assert shared_tile_n >= shared_wave_tile and shared_tile_n % shared_wave_tile == 0, (
+        f"shared stage2 splits N across {num_waves} waves, so shared_tile_n "
+        f"must be a positive multiple of {shared_wave_tile}, got {shared_tile_n}"
     )
     if shared_rowmajor_b_to_lds:
         assert shared_weight_layout == "rowmajor"
@@ -669,12 +1010,18 @@ def compile_kimi_k3_fhmoe_stage2(
     shared_b_lds_bytes = (
         shared_tile_n * shared_tile_k * 2 if shared_rowmajor_b_to_lds else 0
     )
-    lds_bytes = max(
-        BM * TILE_K * 2 + BM * TILE_N * 4,
+    routed_lds_bytes = BM * TILE_K * 2 + BM * TILE_N * 4
+    shared_lds_bytes = (
         BM * shared_tile_k * 2
         + shared_b_lds_bytes
-        + BM * shared_tile_n * 4,
+        + BM * shared_tile_n * 4
     )
+    if path == "routed":
+        lds_bytes = routed_lds_bytes
+    elif path == "shared":
+        lds_bytes = shared_lds_bytes
+    else:
+        lds_bytes = max(routed_lds_bytes, shared_lds_bytes)
 
     @fx.struct
     class SharedStorage:
@@ -689,8 +1036,17 @@ def compile_kimi_k3_fhmoe_stage2(
             f"_stn{shared_tile_n}_stk{shared_tile_k}"
             f"_sblds{int(shared_rowmajor_b_to_lds)}"
             f"_sf{int(shared_first)}"
+            f"_path{path}"
+            f"_s2db{int(stage2_double_buffer)}"
+            f"_rbcm{routed_b_cache_mod}_sbcm{shared_b_cache_mod}"
+            f"{'_rm8epi2' if routed_valid_m_cap == 8 else ''}"
+            f"{'_rm8mb1' if stage2_routed_m8_meta_broadcast else ''}"
+            f"{'_rm8reg1' if stage2_routed_m8_register_epilogue else ''}"
+            f"{'_routeout1' if routed_route_output else ''}"
+            f"{'_wide8' if stage2_wide_n_8wave else ''}"
+            f"{'_s2split' if stage2_split_paths else ''}"
         ),
-        known_block_size=[256, 1, 1],
+        known_block_size=[num_waves * 64, 1, 1],
     )
     def stage2_kernel(
         arg_routed_inter: fx.Int64,
@@ -712,24 +1068,7 @@ def compile_kimi_k3_fhmoe_stage2(
         lane = tx_i32 % fx.Int32(64)
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
 
-        routed_blocks = _global_i32_at(
-            arg_routed_cumsum, fx.Int32(0)
-        ) // fx.Int32(SORT_BM)
-        routed_bound = routed_blocks * fx.Int32(routed_n_blocks)
-        dispatch_bx = bx_i32
-        if const_expr(shared_first):
-            is_shared = bx_i32 < fx.Int32(shared_grid)
-            shifted_bx = bx_i32 - fx.Int32(shared_grid)
-            is_routed = shifted_bx < routed_bound
-            dispatch_bx = is_shared.select(
-                routed_bound + bx_i32,
-                is_routed.select(
-                    shifted_bx,
-                    routed_bound + fx.Int32(shared_grid),
-                ),
-            )
-
-        def routed_tile(pid):
+        def routed_tile(pid, routed_bound):
             if const_expr(routed_xcd_swizzle <= 0):
                 return pid
             nxcd = 8
@@ -755,7 +1094,7 @@ def compile_kimi_k3_fhmoe_stage2(
             n_block = wig // group_size_m
             return m_block * fx.Int32(routed_n_blocks) + n_block
 
-        def run_routed(pid):
+        def run_routed(pid, routed_bound):
             _gemm2_body_a16w4(
                 lds_raw_ptr,
                 arg_routed_inter,
@@ -765,7 +1104,7 @@ def compile_kimi_k3_fhmoe_stage2(
                 arg_routed_stids,
                 arg_routed_sweights,
                 arg_routed_out,
-                routed_tile(pid),
+                routed_tile(pid, routed_bound),
                 lane,
                 wave,
                 i32_M,
@@ -779,6 +1118,13 @@ def compile_kimi_k3_fhmoe_stage2(
                 b_cache_mod=routed_b_cache_mod,
                 w_dtype="fp4",
                 use_k16=use_k16,
+                double_buffer=stage2_double_buffer,
+                num_waves=num_waves,
+                routed_valid_m_cap=routed_valid_m_cap,
+                routed_m8_meta_broadcast=stage2_routed_m8_meta_broadcast,
+                routed_m8_register_epilogue=stage2_routed_m8_register_epilogue,
+                route_output=routed_route_output,
+                topk=KIMI_K3_TOPK,
             )
 
         def run_shared(shared_bx):
@@ -800,24 +1146,56 @@ def compile_kimi_k3_fhmoe_stage2(
                 use_k16=use_k16,
                 shared_weight_layout=shared_weight_layout,
                 rowmajor_b_to_lds=shared_rowmajor_b_to_lds,
+                double_buffer=stage2_double_buffer,
+                num_waves=num_waves,
             )
 
-        if const_expr(routed_persist):
-            grid_nb = fx.Int32(gpu.grid_dim.x)
-            if bx_i32 < routed_bound:
-                run_routed(bx_i32)
-            for iv in range(bx_i32 + grid_nb, routed_bound, gpu.grid_dim.x):
-                gpu.barrier()
-                run_routed(fx.Int32(iv))
-            if bx_i32 < fx.Int32(shared_grid):
-                gpu.barrier()
-                run_shared(bx_i32)
-        elif dispatch_bx < routed_bound:
-            run_routed(dispatch_bx)
+        if const_expr(path == "shared"):
+            run_shared(bx_i32)
         else:
-            shared_bx = dispatch_bx - routed_bound
-            if shared_bx < fx.Int32(shared_grid):
-                run_shared(shared_bx)
+            routed_blocks = _global_i32_at(
+                arg_routed_cumsum, fx.Int32(0)
+            ) // fx.Int32(SORT_BM)
+            routed_bound = routed_blocks * fx.Int32(routed_n_blocks)
+            if const_expr(path == "routed"):
+                if const_expr(routed_persist):
+                    grid_nb = fx.Int32(gpu.grid_dim.x)
+                    if bx_i32 < routed_bound:
+                        run_routed(bx_i32, routed_bound)
+                    for iv in range(bx_i32 + grid_nb, routed_bound, gpu.grid_dim.x):
+                        gpu.barrier()
+                        run_routed(fx.Int32(iv), routed_bound)
+                elif bx_i32 < routed_bound:
+                    run_routed(bx_i32, routed_bound)
+            else:
+                dispatch_bx = bx_i32
+                if const_expr(shared_first):
+                    is_shared = bx_i32 < fx.Int32(shared_grid)
+                    shifted_bx = bx_i32 - fx.Int32(shared_grid)
+                    is_routed = shifted_bx < routed_bound
+                    dispatch_bx = is_shared.select(
+                        routed_bound + bx_i32,
+                        is_routed.select(
+                            shifted_bx,
+                            routed_bound + fx.Int32(shared_grid),
+                        ),
+                    )
+                if const_expr(routed_persist):
+                    grid_nb = fx.Int32(gpu.grid_dim.x)
+                    if bx_i32 < routed_bound:
+                        run_routed(bx_i32, routed_bound)
+                    for iv in range(bx_i32 + grid_nb, routed_bound, gpu.grid_dim.x):
+                        gpu.barrier()
+                        run_routed(fx.Int32(iv), routed_bound)
+                    if bx_i32 < fx.Int32(shared_grid):
+                        gpu.barrier()
+                        run_shared(bx_i32)
+                elif dispatch_bx < routed_bound:
+                    run_routed(dispatch_bx, routed_bound)
+                else:
+                    shared_bx = dispatch_bx - routed_bound
+                    if shared_bx < fx.Int32(shared_grid):
+                        run_shared(shared_bx)
 
     @flyc.jit
     def launch(
@@ -852,7 +1230,7 @@ def compile_kimi_k3_fhmoe_stage2(
             value_attrs={"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None,
         ).launch(
             grid=(fx.Int64(i32_grid), 1, 1),
-            block=(256, 1, 1),
+            block=(num_waves * 64, 1, 1),
             stream=stream,
         )
 

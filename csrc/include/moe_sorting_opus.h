@@ -26,7 +26,9 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           int dispatch_policy                             = 0,
                           std::optional<aiter_tensor_t> local_topk_ids   = std::nullopt,
                           std::optional<aiter_tensor_t> m_indices        = std::nullopt,
-                          std::optional<aiter_tensor_t> reverse_sorted   = std::nullopt);
+                          std::optional<aiter_tensor_t> reverse_sorted   = std::nullopt,
+                          std::optional<aiter_tensor_t> fused_routed_x   = std::nullopt,
+                          std::optional<aiter_tensor_t> fused_routed_x_fp8 = std::nullopt);
 
 #ifdef MOE_SORTING_OPUS_IMPL
 // ============================================================================
@@ -435,6 +437,8 @@ struct MoeSortingHostArgs
     // optional fused-a4w4 sort extras (nullptr = not emitted):
     void* p_m_indices;      // [total_padded] i32: sorted slot -> token id (pad = tokens)
     void* p_reverse_sorted; // [token*topk]  i32: input (token,slot) -> sorted slot
+    const void* p_fused_routed_x; // optional [tokens, fused_routed_x_cols] BF16
+    void* p_fused_routed_x_fp8;   // optional [>=tokens, fused_routed_x_cols] FP8
     opus::index_t tokens;         // if p_local_tokens is not nullptr, this indicate the max possible tokens used for ws/LDS calculation
     opus::index_t unit_size;      // this is the M_a of fused-moe kernel
     opus::index_t num_experts;
@@ -446,6 +450,7 @@ struct MoeSortingHostArgs
     // Besides, we require inter_dim to be multiple of 16 byte(make sure when alloc ws for fmoe)
     opus::index_t moe_buf_interm_dim; // p_moe_buf interm_dim
     opus::index_t moe_buf_elem_bytes; // p_moe_buf byte size(8bit, 16bit, 32bit, etc.)
+    opus::index_t fused_routed_x_cols;
 
 };
 
@@ -1361,6 +1366,45 @@ OPUS_D void moe_buf_set_zero_kernel_2d(void* buf,
         p_buf[i] = zero_;
     }
 }
+
+#if defined(__gfx950__)
+template <opus::index_t kBlockSize = 256>
+OPUS_D void fused_routed_bf16_to_fp8(const void* src,
+                                     void* dst,
+                                     opus::index_t row,
+                                     opus::index_t col,
+                                     opus::index_t gid,
+                                     opus::index_t blocks)
+{
+    // Each lane moves one aligned 16-byte BF16 vector and emits one 8-byte
+    // OCP-FP8 vector.  The scale-one conversion is bit-compatible with the
+    // native-FP8 routed Stage1 input expected on gfx950.
+    const opus::long_index_t total_chunks =
+        static_cast<opus::long_index_t>(row) * col / 8;
+    const uint4* p_src = reinterpret_cast<const uint4*>(src);
+    uint64_t* p_dst    = reinterpret_cast<uint64_t*>(dst);
+    typedef unsigned short ush2 __attribute__((ext_vector_type(2)));
+    typedef short s2 __attribute__((ext_vector_type(2)));
+
+    for(opus::long_index_t i = gid * kBlockSize + threadIdx.x; i < total_chunks;
+        i += blocks * kBlockSize)
+    {
+        const uint4 p = p_src[i];
+        s2 q0{0, 0};
+        s2 q1{0, 0};
+        q0 = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(
+            q0, __builtin_bit_cast(ush2, p.x), 1.0f, false);
+        q0 = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(
+            q0, __builtin_bit_cast(ush2, p.y), 1.0f, true);
+        q1 = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(
+            q1, __builtin_bit_cast(ush2, p.z), 1.0f, false);
+        q1 = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(
+            q1, __builtin_bit_cast(ush2, p.w), 1.0f, true);
+        p_dst[i] = static_cast<uint64_t>(__builtin_bit_cast(uint32_t, q0)) |
+                   (static_cast<uint64_t>(__builtin_bit_cast(uint32_t, q1)) << 32);
+    }
+}
+#endif
 
 } // namespace impl
 
@@ -2658,8 +2702,10 @@ OPUS_H constexpr auto moe_sorting_get_smem_size_p23(int num_experts_, bool emit_
 }
 } // namespace impl
 
-// token count cumsum
-template <typename Problem_>
+// token count cumsum. Keep the optional routed-A conversion in a distinct
+// kernel specialization: device register allocation is kernel-wide even
+// though only the auxiliary workgroups execute the conversion path.
+template <typename Problem_, bool FusedRoutedA_ = false>
 struct MoeSortingMultiPhaseKernel_P23
 {
     using Problem = opus::remove_cvref_t<Problem_>;
@@ -2670,6 +2716,7 @@ struct MoeSortingMultiPhaseKernel_P23
 
     static constexpr opus::index_t kBlockSize = 256;
     static constexpr opus::index_t OCCUPANCY  = 2; // hard coded
+    static constexpr bool kFusedRoutedA       = FusedRoutedA_;
 
     typedef MoeSortingHostArgs MoeSortingKargs;
 
@@ -2689,6 +2736,8 @@ struct MoeSortingMultiPhaseKernel_P23
         void* p_sorted_weights;
         void* p_moe_buf;
         void* p_local_topk_ids;
+        const void* p_fused_routed_x;
+        void* p_fused_routed_x_fp8;
 
         opus::index_t tokens;
         opus::index_t num_experts;
@@ -2702,6 +2751,7 @@ struct MoeSortingMultiPhaseKernel_P23
         // Besides, we require inter_dim to be multiple of 16 byte(make sure when alloc ws for fmoe)
         opus::index_t moe_buf_interm_dim; // p_moe_buf interm_dim
         opus::index_t moe_buf_elem_bytes; // p_moe_buf byte size(8bit, 16bit, 32bit, etc.)
+        opus::index_t fused_routed_x_cols;
     };
 
     OPUS_H static constexpr auto MakeKargs(const Hargs& h)
@@ -2723,6 +2773,8 @@ struct MoeSortingMultiPhaseKernel_P23
 
         k.p_moe_buf        = h.p_moe_buf;
         k.p_local_topk_ids = h.p_local_topk_ids;
+        k.p_fused_routed_x = h.p_fused_routed_x;
+        k.p_fused_routed_x_fp8 = h.p_fused_routed_x_fp8;
 
         k.tokens         = h.tokens;
         k.num_experts    = h.num_experts;
@@ -2732,6 +2784,7 @@ struct MoeSortingMultiPhaseKernel_P23
 
         k.moe_buf_interm_dim = h.moe_buf_interm_dim;
         k.moe_buf_elem_bytes = h.moe_buf_elem_bytes;
+        k.fused_routed_x_cols = h.fused_routed_x_cols;
 
         return k;
     }
@@ -2750,6 +2803,25 @@ struct MoeSortingMultiPhaseKernel_P23
 
     OPUS_H static constexpr auto GridSize(const Hargs& h)
     {
+        if constexpr(kFusedRoutedA)
+        {
+            // The fused clear and BF16-to-FP8 conversion both process one
+            // 16-byte BF16 chunk per lane. Launch only enough auxiliary
+            // workgroups to cover those chunks instead of the fixed 512.
+            constexpr opus::index_t kFusedElemsPerChunk = 8;
+            constexpr opus::index_t kMaxFusedExtraWorkgroups = 512;
+            const opus::long_index_t total_chunks =
+                static_cast<opus::long_index_t>(h.tokens) * h.fused_routed_x_cols /
+                kFusedElemsPerChunk;
+            const opus::long_index_t required_workgroups =
+                (total_chunks + kBlockSize - 1) / kBlockSize;
+            const opus::index_t extra_workgroups = static_cast<opus::index_t>(
+                required_workgroups < kMaxFusedExtraWorkgroups
+                    ? required_workgroups
+                    : kMaxFusedExtraWorkgroups);
+            return dim3(h.num_experts + extra_workgroups);
+        }
+
         return dim3(h.num_experts + get_num_cu() * OCCUPANCY);
     }
 
@@ -2780,12 +2852,25 @@ struct MoeSortingMultiPhaseKernel_P23
 
         if(static_cast<opus::index_t>(blockIdx.x) >= kargs.num_experts)
         {
+            const opus::index_t clear_gid = blockIdx.x - kargs.num_experts;
+            const opus::index_t clear_blocks = gridDim.x - kargs.num_experts;
             impl::moe_buf_set_zero_kernel_2d<kBlockSize>(kargs.p_moe_buf,
                                                          tokens,
                                                          kargs.moe_buf_interm_dim,
                                                          kargs.moe_buf_elem_bytes,
-                                                         blockIdx.x - kargs.num_experts,
-                                                         gridDim.x - kargs.num_experts);
+                                                         clear_gid,
+                                                         clear_blocks);
+#if defined(__gfx950__)
+            if constexpr(kFusedRoutedA)
+            {
+                impl::fused_routed_bf16_to_fp8<kBlockSize>(kargs.p_fused_routed_x,
+                                                           kargs.p_fused_routed_x_fp8,
+                                                           tokens,
+                                                           kargs.fused_routed_x_cols,
+                                                           clear_gid,
+                                                           clear_blocks);
+            }
+#endif
             return;
         }
 
@@ -3396,7 +3481,8 @@ moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::st
         return aiter::make_kernel(kernel{}, grids, blocks, 0, kargs);                          \
     }()
 
-#define OPUS_MOE_SORTING_MP_23(mesh_type_, unroll_num_, expert_masking_, local_token_)          \
+#define OPUS_MOE_SORTING_MP_23(                                                                 \
+    mesh_type_, unroll_num_, expert_masking_, local_token_, fused_routed_a_)                    \
     [&]() {                                                                                     \
         constexpr opus::index_t unroll_num = unroll_num_;                                       \
         constexpr bool expert_masking      = expert_masking_;                                   \
@@ -3407,12 +3493,13 @@ moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::st
                                                                         unroll_num,             \
                                                                         expert_masking,         \
                                                                         local_token>;           \
-        using kernel                       = aiter::MoeSortingMultiPhaseKernel_P23<ms_problem>; \
-        auto kargs                         = kernel::MakeKargs(a);                              \
-        const dim3 grids                   = kernel::GridSize(a);                               \
-        const dim3 blocks                  = kernel::BlockSize(a);                              \
-        const auto lds_size                = kernel::GetSmemSize(a);                            \
-        return aiter::make_kernel(kernel{}, grids, blocks, lds_size, kargs);                    \
+        using kernel =                                                                            \
+            aiter::MoeSortingMultiPhaseKernel_P23<ms_problem, fused_routed_a_>;                  \
+        auto kargs          = kernel::MakeKargs(a);                                              \
+        const dim3 grids    = kernel::GridSize(a);                                               \
+        const dim3 blocks   = kernel::BlockSize(a);                                              \
+        const auto lds_size = kernel::GetSmemSize(a);                                            \
+        return aiter::make_kernel(kernel{}, grids, blocks, lds_size, kargs);                     \
     }()
 
 #define OPUS_MOR_SORTING_MP_DISPATCH_SMALL_(mesh_type_, token_vec_0_, token_vec_1_, token_vec_23_) \
@@ -3423,7 +3510,8 @@ moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::st
             float ave_time = aiter::launch_kernel(                                                 \
                 s,                                                                                 \
                 OPUS_MOE_SORTING_MP_0_V2(mesh_type_, token_vec_0_, true, true),                    \
-                OPUS_MOE_SORTING_MP_23(mesh_type_, token_vec_23_, true, true));                    \
+                OPUS_MOE_SORTING_MP_23(                                                           \
+                    mesh_type_, token_vec_23_, true, true, false));                                \
             return ave_time;                                                                       \
         }                                                                                          \
         else                                                                                       \
@@ -3431,7 +3519,8 @@ moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::st
             float ave_time = aiter::launch_kernel(                                                 \
                 s,                                                                                 \
                 OPUS_MOE_SORTING_MP_0_V2(mesh_type_, token_vec_0_, true, false),                   \
-                OPUS_MOE_SORTING_MP_23(mesh_type_, token_vec_23_, true, false));                   \
+                OPUS_MOE_SORTING_MP_23(                                                           \
+                    mesh_type_, token_vec_23_, true, false, false));                               \
             return ave_time;                                                                       \
         }                                                                                          \
     }                                                                                              \
@@ -3442,7 +3531,8 @@ moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::st
             float ave_time = aiter::launch_kernel(                                                 \
                 s,                                                                                 \
                 OPUS_MOE_SORTING_MP_0_V2(mesh_type_, token_vec_0_, false, true),                   \
-                OPUS_MOE_SORTING_MP_23(mesh_type_, token_vec_23_, false, true));                   \
+                OPUS_MOE_SORTING_MP_23(                                                           \
+                    mesh_type_, token_vec_23_, false, true, false));                               \
             return ave_time;                                                                       \
         }                                                                                          \
         else                                                                                       \
@@ -3450,7 +3540,8 @@ moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::st
             float ave_time = aiter::launch_kernel(                                                 \
                 s,                                                                                 \
                 OPUS_MOE_SORTING_MP_0_V2(mesh_type_, token_vec_0_, false, false),                  \
-                OPUS_MOE_SORTING_MP_23(mesh_type_, token_vec_23_, false, false));                  \
+                OPUS_MOE_SORTING_MP_23(                                                           \
+                    mesh_type_, token_vec_23_, false, false, false));                              \
             return ave_time;                                                                       \
         }                                                                                          \
     }
@@ -3465,7 +3556,8 @@ moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::st
                 maybe_clear_workspace,                                                       \
                 OPUS_MOE_SORTING_MP_0_V1(mesh_type_, token_vec_0_, true, true),              \
                 OPUS_MOE_SORTING_MP_1(mesh_type_, token_vec_1_, true, true),                 \
-                OPUS_MOE_SORTING_MP_23(mesh_type_, token_vec_23_, true, true));              \
+                OPUS_MOE_SORTING_MP_23(                                                     \
+                    mesh_type_, token_vec_23_, true, true, false));                          \
             return ave_time;                                                                 \
         }                                                                                    \
         else                                                                                 \
@@ -3475,7 +3567,8 @@ moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::st
                 maybe_clear_workspace,                                                       \
                 OPUS_MOE_SORTING_MP_0_V1(mesh_type_, token_vec_0_, true, false),             \
                 OPUS_MOE_SORTING_MP_1(mesh_type_, token_vec_1_, true, false),                \
-                OPUS_MOE_SORTING_MP_23(mesh_type_, token_vec_23_, true, false));             \
+                OPUS_MOE_SORTING_MP_23(                                                     \
+                    mesh_type_, token_vec_23_, true, false, false));                         \
             return ave_time;                                                                 \
         }                                                                                    \
     }                                                                                        \
@@ -3488,7 +3581,8 @@ moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::st
                 maybe_clear_workspace,                                                       \
                 OPUS_MOE_SORTING_MP_0_V1(mesh_type_, token_vec_0_, false, true),             \
                 OPUS_MOE_SORTING_MP_1(mesh_type_, token_vec_1_, false, true),                \
-                OPUS_MOE_SORTING_MP_23(mesh_type_, token_vec_23_, false, true));             \
+                OPUS_MOE_SORTING_MP_23(                                                     \
+                    mesh_type_, token_vec_23_, false, true, false));                         \
             return ave_time;                                                                 \
         }                                                                                    \
         else                                                                                 \
@@ -3498,7 +3592,8 @@ moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::st
                 maybe_clear_workspace,                                                       \
                 OPUS_MOE_SORTING_MP_0_V1(mesh_type_, token_vec_0_, false, false),            \
                 OPUS_MOE_SORTING_MP_1(mesh_type_, token_vec_1_, false, false),               \
-                OPUS_MOE_SORTING_MP_23(mesh_type_, token_vec_23_, false, false));            \
+                OPUS_MOE_SORTING_MP_23(                                                     \
+                    mesh_type_, token_vec_23_, false, false, false));                        \
             return ave_time;                                                                 \
         }                                                                                    \
     }
@@ -3540,11 +3635,41 @@ moe_sorting_opus(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::strea
 }
 
 inline float
+moe_sorting_opus_mp_fused_routed_a(moe_sorting_opus_args a, aiter::stream_config s)
+{
+    // The public binding gates this path to M<=8, E896/topk16/unit32, and no
+    // local/auxiliary outputs. Instantiate only that supported small-M shape
+    // instead of emitting fused variants for every generic P23 combination.
+    using ms_index_t     = opus::index_t;
+    using ms_weight_type = float;
+    return aiter::launch_kernel(
+        s,
+        OPUS_MOE_SORTING_MP_0_V2(opus::index_t, 1, false, false),
+        OPUS_MOE_SORTING_MP_23(opus::index_t, 1, false, false, true));
+}
+
+inline float
 moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::stream_config s)
 {
     bool is_local_token = a.p_local_tokens != nullptr;
     if(t.weight_type == "fp32" && t.index_type == "i32")
     {
+        if(a.p_fused_routed_x != nullptr)
+        {
+            const bool fused_routed_a_supported =
+                a.p_fused_routed_x_fp8 != nullptr && a.tokens >= 1 && a.tokens <= 8 &&
+                a.num_experts == 896 && a.topk == 16 && a.unit_size == 32 &&
+                a.fused_routed_x_cols == 3584 && t.dispatch_policy == 0 &&
+                !t.local_expert_masking && a.p_local_expert_mask == nullptr &&
+                a.p_local_tokens == nullptr && a.p_local_topk_ids == nullptr &&
+                a.p_m_indices == nullptr && a.p_reverse_sorted == nullptr;
+            if(!fused_routed_a_supported)
+            {
+                return -1;
+            }
+            return moe_sorting_opus_mp_fused_routed_a(a, s);
+        }
+
         using ms_index_t     = opus::index_t;
         using ms_weight_type = float;
 

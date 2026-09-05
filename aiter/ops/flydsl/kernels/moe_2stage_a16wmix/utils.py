@@ -17,6 +17,7 @@ Used by both stage1 (:mod:`gemm1`) and stage2 (:mod:`gemm2`):
 from collections.abc import Callable
 from typing import NamedTuple
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
@@ -187,7 +188,7 @@ def _a16w4_swizzle_xor16(row, col_bytes, k_blocks16, *, enable=False):
     """A-LDS bank-conflict XOR swizzle (aiter swizzle_xor16: col ^ ((row&(kb16-1))*16)).
 
     Both the DMA write and the LDS read go through this helper so the physical layout
-    stays consistent. gemm1 keeps linear (enable=False); gemm2 enables it.
+    stays consistent. gemm2 enables it, while gemm1 selects it per profile.
     """
     if not enable:
         return col_bytes
@@ -248,11 +249,13 @@ def make_a_loader(
     a_ptr,
     a_num_bytes,
     a_load_threads,
+    workgroup_threads=256,
     row_base_dwords,
     dma_cache_mod,
     dma_via_vgpr,
     k_grp_base_bytes=None,
     A_SLOT_BYTES=0,
+    active_load_threads=None,
 ):
     """Build the shared A (activation) LDS path: global->LDS staging + fragment reads.
 
@@ -272,14 +275,18 @@ def make_a_loader(
       * ``swizzle``          gemm2 XOR-swizzles A to kill LDS bank conflicts: the GMEM
                              source column is swizzled on the write (buffer_load_lds
                              ignores an arbitrary swizzled per-lane LDS dest -> NaN) and
-                             ``load`` applies the SAME swizzle on the read. gemm1 is
-                             linear -- its DMA source is already conflict-free.
+                             ``load`` applies the SAME swizzle on the read. gemm1
+                             selects the layout per profile.
       * ``k_grp_base_bytes`` gemm1 only: base of this wave's k_wave group. Combined with
                              ``A_SLOT_BYTES`` and the per-call ``slot`` it selects the
                              double-buffer ping/pong slot. None (gemm2) omits the term
                              entirely -- stage2 has a single, unslotted A region.
       * ``a_load_threads``   threads cooperating on one tile (< 256 when k_wave > 1
                              splits the block into per-k-group loader sets).
+      * ``active_load_threads`` optional prefix of block threads that may issue the
+                             global-to-LDS copies. Stage2's 8-wave candidate keeps the
+                             existing 256-thread/16-byte transaction pattern while the
+                             other four waves participate in compute and barriers.
       * ``dma_via_vgpr``     gfx942 (use_k16) staging fallback, see below.
     """
     elem_bytes = 2  # bf16
@@ -290,7 +297,10 @@ def make_a_loader(
     tile_k_dwords = (TILE_K * elem_bytes) // 4
     tx_i32 = fx.Int32(gpu.thread_id("x"))
     chunk_i32 = x_load_bytes // 4  # 4
-    if const_expr(a_load_threads < 256):
+    if active_load_threads is not None:
+        assert active_load_threads == a_load_threads
+        x_load_tid = tx_i32 % fx.Int32(a_load_threads)
+    elif const_expr(a_load_threads < workgroup_threads):
         x_load_tid = tx_i32 % fx.Int32(a_load_threads)
     else:
         x_load_tid = tx_i32
@@ -351,12 +361,25 @@ def make_a_loader(
                 )
             src = fx.slice(x_dma_tiles4, (None, global_byte // fx.Int32(16)))
             dst = fx.slice(tiles, (None, lds_byte // fx.Int32(16)))
-            if const_expr(dma_via_vgpr):
-                r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
-                fx.copy(x_dma_atom, src, r)
-                fx.copy(lds_atom, r, dst)
+
+            def issue_copy():
+                if const_expr(dma_via_vgpr):
+                    r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
+                    fx.copy(x_dma_atom, src, r)
+                    fx.copy(lds_atom, r, dst)
+                else:
+                    fx.copy(x_dma_atom, src, dst)
+
+            if const_expr(active_load_threads is None):
+                issue_copy()
             else:
-                fx.copy(x_dma_atom, src, dst)
+
+                @flyc.jit
+                def issue_copy_if_active():
+                    if tx_i32 < fx.Int32(active_load_threads):
+                        issue_copy()
+
+                issue_copy_if_active()
 
     def lds_load_a(mi, ku, slot=0):
         row = row_a_lds + fx.Int32(mi * 16)
@@ -402,14 +425,16 @@ class _BCol(NamedTuple):
 class _BLoader(NamedTuple):
     """The B (weight) operand path, built by :func:`make_b_loader`.
 
-    All three callables are already specialized for ``w_dtype``, so the stages carry no
+    All callables are already specialized for ``w_dtype``, so the stages carry no
     weight-dtype branches: they build ``col`` descriptors once outside the K loop, then
-    ``load_raw`` + ``load_scale`` + ``upconvert`` per tile.
+    ``load_raw`` + ``load_scale`` + ``upconvert`` per tile. ``load_raw_ku`` is the
+    row-major BF16-only single-K32 surface used by register-ring experiments.
     """
 
     col: Callable  # col(*n_terms) -> _BCol for one 16-wide N block
     col_pair: Callable  # col_pair(*n_terms, shift=) -> (_BCol, _BCol) gate|up pair
     load_raw: Callable  # load_raw(base_k, col) -> per-K-step raw fragments
+    load_raw_ku: Callable  # load_raw_ku(base_k, col, ku) -> one raw BF16 fragment
     load_scale: Callable  # load_scale(base_k, col) -> per-K-step f32 scales
     upconvert: Callable  # upconvert(raw, ku, scale) -> v8bf16 MMA operand
 
@@ -673,6 +698,21 @@ def make_b_loader(
             raw.append(four)
         return raw
 
+    def load_b_raw_bf16_ku(base_k, n_blk, n_intra, ku):
+        if const_expr(not _is_bf16_rowmajor):
+            raise ValueError("single-K32 B loads require row-major BF16 weights")
+        row = n_blk * fx.Int32(16) + n_intra
+        elem_idx = (
+            row * fx.Int32(K)
+            + base_k
+            + fx.Int32((ku // 4) * 128 + (ku % 4) * 8)
+            + lane_div_16 * fx.Int32(32)
+        )
+        # elem_idx is a bf16-elem offset; dword index = elem_idx*2/4, tile idx = /4.
+        r = fx.make_rmem_tensor(w_reg_lay, fx.Int32)
+        fx.copy(w_copy_atom, fx.slice(w_tiles, (None, elem_idx // fx.Int32(8))), r)
+        return fx.Vector(fx.memref_load_vec(r)).bitcast(fx.BFloat16)  # v8bf16
+
     def load_b_raw_bf16(base_k, n_blk, n_intra):
         # Raw bf16 W: one dwordx4 (8 bf16) per ku = one MFMA K32 B fragment (v8bf16,
         # the MMA operand directly). K map matches fp4: bf_k0 = base_k//32 + (ku//4)*4
@@ -788,6 +828,9 @@ def make_b_loader(
     def load_raw(base_k, col):
         return _load_raw(base_k, col.n_blk, col.n_intra)
 
+    def load_raw_ku(base_k, col, ku):
+        return load_b_raw_bf16_ku(base_k, col.n_blk, col.n_intra, ku)
+
     def load_scale(base_k, col):
         if const_expr(_is_bf16):
             # No scale: one None per K micro-step keeps the per-ku indexing uniform.
@@ -800,6 +843,7 @@ def make_b_loader(
         col=col,
         col_pair=col_pair,
         load_raw=load_raw,
+        load_raw_ku=load_raw_ku,
         load_scale=load_scale,
         upconvert=upconvert_b,
     )

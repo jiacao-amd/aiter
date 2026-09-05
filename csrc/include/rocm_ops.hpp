@@ -1471,7 +1471,9 @@ namespace py = pybind11;
           py::arg("dispatch_policy")   = 0,            \
           py::arg("local_topk_ids")    = std::nullopt, \
           py::arg("m_indices")         = std::nullopt, \
-          py::arg("reverse_sorted")    = std::nullopt);
+          py::arg("reverse_sorted")    = std::nullopt, \
+          py::arg("fused_routed_x")    = std::nullopt, \
+          py::arg("fused_routed_x_fp8") = std::nullopt);
 
 #define PA_SPARSE_PREFILL_OPUS_PYBIND               \
     m.def("pa_sparse_prefill_gfx950_opus_fwd",      \

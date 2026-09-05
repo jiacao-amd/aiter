@@ -5,6 +5,8 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import scf
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -13,6 +15,9 @@ from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.act import gate_up_act, situ_params
 from aiter.ops.flydsl.kernels.mxfp4_gemm_common import lds_typed_ptr, lds_vec_load
 from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
+
+from .. import communication_ops_utils as comm_ops
+from ..splitk_epilogue import CPOL_COHERENT
 
 from .utils import (
     _BCol,
@@ -57,7 +62,19 @@ def _gemm1_body_a16w4(
     w_dtype="fp4",
     w_layout="standard",
     k_wave=1,
+    num_waves=4,
     use_k16=False,
+    shared_wave_local_wait=False,
+    shared_pipeline_wait="default",
+    grid_split_k=1,
+    grid_split_n_major=False,
+    shared_fused_reduce=False,
+    identity_m_indices=False,
+    a_lds_swizzle=False,
+    vec2_partials=False,
+    split_workspace_rows=8,
+    arg_split_workspace=None,
+    arg_split_semaphore=None,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W) fused stage1 gemm1 body.
 
@@ -66,17 +83,72 @@ def _gemm1_body_a16w4(
     -> bf16 intermediate ``[sorted_size, inter_dim]`` stored by SORTED POSITION.
     """
     N_OUT = 2 * INTER
+    if grid_split_k < 1 or K % grid_split_k:
+        raise ValueError(
+            f"grid_split_k must divide K; got grid_split_k={grid_split_k}, K={K}"
+        )
+    if grid_split_n_major and grid_split_k <= 1:
+        raise ValueError("grid_split_n_major requires grid_split_k > 1")
+    if num_waves not in (4, 8):
+        raise ValueError(f"num_waves must be 4 or 8, got {num_waves}")
+    if num_waves % k_wave:
+        raise ValueError(
+            f"num_waves={num_waves} must be divisible by k_wave={k_wave}"
+        )
+    num_n_waves = num_waves // k_wave
+    if TILE_N % num_n_waves or TILE_N // num_n_waves < 16:
+        raise ValueError(
+            "TILE_N must provide at least 16 columns per N wave; got "
+            f"TILE_N={TILE_N}, num_waves={num_waves}, k_wave={k_wave}"
+        )
+    if shared_fused_reduce and not (
+        grid_split_k == 7
+        and k_wave > 1
+        and TILE_N == 16 * num_n_waves
+    ):
+        raise ValueError(
+            "shared_fused_reduce requires grid_split_k=7 with "
+            "one 16-column N tile per wave and k_wave > 1"
+        )
+    if identity_m_indices and grid_split_k <= 1:
+        raise ValueError("identity_m_indices requires grid_split_k > 1")
+    if a_lds_swizzle and grid_split_k <= 1:
+        raise ValueError("a_lds_swizzle requires grid_split_k > 1")
+    if vec2_partials and grid_split_k <= 1:
+        raise ValueError("vec2_partials requires grid_split_k > 1")
+    if grid_split_k > 1:
+        if not (
+            w_dtype == "bf16"
+            and w_layout == "rowmajor"
+            and BM == 16
+            and TILE_N in (16, 32, 64)
+            and TILE_K == 128
+            and K == 7168
+            and INTER == 768
+            and NE == 1
+            and TOPK == 1
+            and TILE_N == 16 * num_n_waves
+            and not use_k16
+            and act == "situv2"
+            and split_workspace_rows == 8
+            and arg_split_workspace is not None
+            and arg_split_semaphore is not None
+        ):
+            raise ValueError(
+                "grid-split shared Stage1 requires the Kimi-K3 row-major BF16 "
+                "BM16 with one 16-column N tile per wave, "
+                "BK128/SiTUv2, and an 8-row workspace"
+            )
     elem_bytes = 2  # bf16
     a_elem_bytes = 2
     KH_TILE_BYTES = TILE_K * a_elem_bytes  # A-LDS bytes per row per K-tile
     LDS_STRIDE = TILE_K  # bf16 elems per LDS row (pad_k=0, LDS128)
     m_repeat = BM // 16
     k_unroll = KH_TILE_BYTES // 64  # bf16 8-per-lane K micro-steps per K-tile
-    # Wave partition num_n_waves x k_wave. k_wave=1: 4 waves split TILE_N (TILE_N/4 each).
+    # Wave partition num_n_waves x k_wave. The 8-wave Kimi specialization keeps
+    # the same per-wave N work while widening the workgroup N tile.
     # k_wave>1 (aiter intra-block slice-K): each wave does a K-slice (klen=K/k_wave) of a
     # wider N-slice; partials LDS-reduced across k-group peers before epilogue.
-    _NUM_WAVES = 4
-    num_n_waves = _NUM_WAVES // k_wave
     if const_expr(k_wave > 1):
         wave_n_id = wave % fx.Int32(num_n_waves)
         wave_k_id = rocdl.readfirstlane(T.i32, wave // fx.Int32(num_n_waves))
@@ -85,15 +157,102 @@ def _gemm1_body_a16w4(
         wave_k_id = fx.Int32(0)
     _n_per_wave = TILE_N // num_n_waves
     num_acc_n = _n_per_wave // 16
-    klen = K // k_wave
+    grid_klen = K // grid_split_k
+    if grid_klen % k_wave:
+        raise ValueError(
+            f"K/grid_split_k={grid_klen} must be divisible by k_wave={k_wave}"
+        )
+    klen = grid_klen // k_wave
     K_TILES_TOTAL = klen // TILE_K
     # A load is group-local: num_n_waves*64 threads load each k-group's BM x TILE_K tile.
     a_load_threads = num_n_waves * 64
     k_blocks16 = KH_TILE_BYTES // 16
     # Software pipeline (aiter-aligned): A-LDS double-buffered (tile K+1 DMA -> pong while
     # K reads ping); B + B-scale for K+1 issued before K's MFMA to stay in flight. A-DMA
-    # completes on lgkmcnt, so only rocdl.s_waitcnt(lgkmcnt=0) + one barrier gate the ds_read.
+    # completes on lgkmcnt; cross-wave consumers also need one barrier before ds_read.
     _PIPE = K_TILES_TOTAL > 1
+    if shared_pipeline_wait not in (
+        "default",
+        "fenced",
+        "partial",
+        "defer3",
+        "deferup3",
+        "ring4",
+    ):
+        raise ValueError(
+            "shared_pipeline_wait must be 'default', 'fenced', 'partial', "
+            "'defer3', 'deferup3', or 'ring4', "
+            f"got {shared_pipeline_wait!r}"
+        )
+    _DEFER3 = shared_pipeline_wait == "defer3"
+    _DEFER_UP3 = shared_pipeline_wait == "deferup3"
+    _RING4 = shared_pipeline_wait == "ring4"
+    _PARTIAL_WAIT_PROFILE = (
+        w_dtype == "bf16"
+        and w_layout == "rowmajor"
+        and BM == 16
+        and TILE_K == 128
+        and K == 7168
+        and INTER == 768
+        and _PIPE
+        and not use_k16
+        and (
+            (
+                grid_split_k == 1
+                and TILE_N == 16 * num_n_waves
+                and k_wave == 4
+            )
+            or (
+                grid_split_k == 7
+                and (
+                    (
+                        TILE_N == 16 * num_n_waves
+                        and k_wave == 4
+                    )
+                    or (
+                        TILE_N == 16 * num_n_waves
+                        and k_wave == 2
+                    )
+                )
+            )
+        )
+    )
+    if shared_pipeline_wait != "default" and not _PARTIAL_WAIT_PROFILE:
+        raise ValueError(
+            "non-default shared_pipeline_wait requires the pipelined Kimi-K3 "
+            "BF16 row-major BM16/BK128 BN16/k_wave4 or "
+            "grid-split-7 BN16/k_wave4 or BN32/k_wave2 path"
+        )
+    _K32_RING_PROFILE = (
+        grid_split_k == 7
+        and TILE_N == 16 * num_n_waves
+        and k_wave == 2
+        and k_unroll == 4
+        and num_acc_n == 1
+        and m_repeat == 1
+    )
+    if (_DEFER3 or _DEFER_UP3 or _RING4) and not _K32_RING_PROFILE:
+        raise ValueError(
+            "defer3/deferup3/ring4 shared_pipeline_wait requires the Kimi-K3 "
+            "grid-split-7 BM16/BN32/BK128/k_wave2 profile with one "
+            "accumulator N block and four K32 steps"
+        )
+    if shared_wave_local_wait and shared_pipeline_wait != "default":
+        raise ValueError(
+            "shared_wave_local_wait and non-default shared_pipeline_wait are "
+            "mutually exclusive"
+        )
+    if shared_wave_local_wait and not (
+        w_dtype == "bf16"
+        and w_layout == "rowmajor"
+        and k_wave == 4
+        and num_n_waves == 1
+        and _PIPE
+    ):
+        raise ValueError(
+            "shared_wave_local_wait requires the pipelined BF16 row-major "
+            "k_wave=4 path with one N wave"
+        )
     A_LDS_STAGES = 2 if _PIPE else 1
     A_SLOT_BYTES = BM * KH_TILE_BYTES
     # Per-k-group A-LDS region (single region at k_wave=1).
@@ -104,9 +263,24 @@ def _gemm1_body_a16w4(
     lane_mod_16 = lane % fx.Int32(16)
 
     # ---- grid decode: m-block (expert block) x n-block (inter tile) -----------
-    n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
-    m_block_idx = bx_i32 // fx.Int32(NUM_N_BLOCKS)
-    e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block_idx)))
+    if const_expr(grid_split_k > 1):
+        if const_expr(grid_split_n_major):
+            n_block_idx = bx_i32 // fx.Int32(grid_split_k)
+            split_id = rocdl.readfirstlane(
+                T.i32, _raw(bx_i32 % fx.Int32(grid_split_k))
+            )
+        else:
+            n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
+            split_id = rocdl.readfirstlane(
+                T.i32, _raw(bx_i32 // fx.Int32(NUM_N_BLOCKS))
+            )
+        m_block_idx = fx.Int32(0)
+        e = fx.Int32(0)
+    else:
+        n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
+        split_id = fx.Int32(0)
+        m_block_idx = bx_i32 // fx.Int32(NUM_N_BLOCKS)
+        e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block_idx)))
     # The compute tile may be narrower than the fixed-width sorting block.  Kimi
     # decode uses BM=16 for M<=16 while moe_sorting continues to lay out every
     # expert at SORT_BM=32 rows, so sorted-row addressing must not use BM.
@@ -136,22 +310,38 @@ def _gemm1_body_a16w4(
     # (clamped) stores land OOB. KEPT RAW: the output resource + masked buffer_store need a
     # dynamic (runtime cumsum0) num_records and per-store predication; the fx.copy layout
     # API does not express the masked scalar scatter this epilogue relies on.
-    _cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
-    out_rsrc = buffer_ops.create_buffer_resource_from_addr(
-        _raw(fx.Int64(arg_out)),
-        num_records_bytes=_raw(fx.Int64(_cumsum0) * fx.Int64(INTER * 2)),
-    )
+    if const_expr(grid_split_k > 1):
+        _cumsum0 = fx.Int32(split_workspace_rows)
+        out_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            _raw(fx.Int64(arg_out)),
+            num_records_bytes=_raw(fx.Int64(i32_ntok) * fx.Int64(INTER * 2)),
+        )
+        split_workspace_elems = split_workspace_rows * 2 * grid_split_k * INTER
+        split_workspace_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            _raw(fx.Int64(arg_split_workspace)),
+            num_records_bytes=split_workspace_elems * 4,
+        )
+    else:
+        _cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
+        out_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            _raw(fx.Int64(arg_out)),
+            num_records_bytes=_raw(fx.Int64(_cumsum0) * fx.Int64(INTER * 2)),
+        )
 
     # ---- A path (shared with gemm2, see utils.make_a_loader) -------------------
     # a_load_threads (256 at k_wave=1) cooperatively stage one k-group's BM x TILE_K bf16
-    # tile into LDS; stage1's A-LDS is carved into k_wave groups x 2 pipeline slots, and
-    # is NOT XOR-swizzled (its DMA source is already conflict-free).
+    # tile into LDS; stage1's A-LDS is carved into k_wave groups x 2 pipeline slots.
+    # The integrated path can opt into the same XOR16 layout used by gemm2.
     c_k_div4 = (K * elem_bytes) // 4
 
     def _a_row_base_dwords(row_local):
-        # arg_mind holds the raw sorted_token_ids (token in low 24 bits, slot in high 8).
-        fused = fx.Int32(_global_i32_at(arg_mind, bx_m + row_local))
-        return (fused & fx.Int32(0x00FFFFFF)) * fx.Int32(c_k_div4)
+        if const_expr(identity_m_indices):
+            token = bx_m + row_local
+        else:
+            # Raw sorted_token_ids: token in low 24 bits, slot in high 8.
+            fused = fx.Int32(_global_i32_at(arg_mind, bx_m + row_local))
+            token = fused & fx.Int32(0x00FFFFFF)
+        return token * fx.Int32(c_k_div4)
 
     # Per-k-group base byte offset into the A-LDS region (zero at k_wave=1).
     if const_expr(k_wave > 1):
@@ -168,16 +358,42 @@ def _gemm1_body_a16w4(
         k_blocks16=k_blocks16,
         lane_div_16=lane_div_16,
         lane_mod_16=lane_mod_16,
-        swizzle=False,
+        swizzle=a_lds_swizzle,
         a_ptr=arg_x,
         a_num_bytes=fx.Int64(i32_ntok) * fx.Int64(c_k_div4) * fx.Int64(4),
         a_load_threads=a_load_threads,
+        workgroup_threads=num_waves * 64,
         row_base_dwords=_a_row_base_dwords,
         dma_cache_mod=2,
         dma_via_vgpr=use_k16,
         k_grp_base_bytes=k_grp_base_bytes,
         A_SLOT_BYTES=A_SLOT_BYTES,
     )
+
+    def issue_a_tile(base_k, slot):
+        # Keep the direct-to-LDS A copy before the younger B requests.  The
+        # partial-wait mode depends on that order; fenced isolates the schedule
+        # benefit while retaining the conservative full VMEM wait.
+        if const_expr(shared_pipeline_wait != "default"):
+            rocdl.sched_barrier(0)
+        a_loader.store_tile(base_k, slot=slot)
+        if const_expr(shared_pipeline_wait != "default"):
+            rocdl.sched_barrier(0)
+
+    def wait_a_tile():
+        if const_expr(
+            shared_pipeline_wait in ("partial", "defer3", "deferup3", "ring4")
+        ):
+            # Both supported BF16 row-major profiles issue exactly eight younger
+            # B VMEM loads per wave (gate/up x four K32 fragments). Wait only for
+            # the older A direct-to-LDS copies, then synchronize the A-load group.
+            rocdl.s_waitcnt(0x0078)
+            gpu.barrier()
+        else:
+            # Raw CDNA waitcnt encoding for vmcnt=max, expcnt=max, lgkmcnt=0.
+            rocdl.s_waitcnt(0xC07F)
+            if const_expr(not shared_wave_local_wait):
+                gpu.barrier()
 
     # ---- N-column addressing for gate/up (SEPARATED; wave owns _n_per_wave) ----
     # The up column of a gate block sits INTER further along N, so both operands come
@@ -271,45 +487,226 @@ def _gemm1_body_a16w4(
                     _mma(acc_gate[mi][ni], a8, gb)
                     _mma(acc_up[mi][ni], a8, ub)
 
+    def load_b_k32_pair(base_k, ku):
+        # The experimental schedules are restricted above to one row-major
+        # BF16 N block, so each pair is exactly two dwordx4 VMEM loads.
+        return (
+            b_loader.load_raw_ku(base_k, cols_gate[0], ku),
+            b_loader.load_raw_ku(base_k, cols_up[0], ku),
+        )
+
+    def compute_b_k32_pair(b_pair, a_frags, ku):
+        # One A fragment feeds the gate/up MFMA pair for this K32 slot.
+        a8 = a_frags[0][ku]
+        _mma(acc_gate[0][0], a8, b_pair[0])
+        _mma(acc_up[0][0], a8, b_pair[1])
+
     # ---- main K loop (ISA-aligned software pipeline) --------------------------
     # k-group global K base = wave_k_id * klen (0 at k_wave=1). Loop runs K_TILES_TOTAL.
-    if const_expr(k_wave > 1):
+    if const_expr(grid_split_k > 1):
+        k_base = split_id * fx.Int32(grid_klen) + wave_k_id * fx.Int32(klen)
+    elif const_expr(k_wave > 1):
         k_base = wave_k_id * fx.Int32(klen)
     else:
         k_base = fx.Int32(0)
 
     if const_expr(not _PIPE):
-        a_loader.store_tile(k_base, slot=0)
+        issue_a_tile(k_base, slot=0)
         b0 = load_b_tile(k_base)
-        # Raw CDNA waitcnt encoding for vmcnt=max, expcnt=max, lgkmcnt=0.
-        # This is equivalent to ``s_waitcnt(lgkmcnt=0)`` in newer FlyDSL.
-        rocdl.s_waitcnt(0xC07F)
-        gpu.barrier()
+        wait_a_tile()
         compute_tile(b0, preload_a(0))
         gpu.barrier()
+    elif const_expr(_DEFER3):
+        # Keep the first three next-tile K32 pairs prefetched, but do not make
+        # the final pair live until the current tile's first pair is consumed.
+        # Peak shared-B state is therefore seven pairs (56 VGPR), not eight.
+        issue_a_tile(k_base, slot=0)
+        b_cur = [load_b_k32_pair(k_base, ku) for ku in range_constexpr(k_unroll)]
+        for kt in range_constexpr(K_TILES_TOTAL):
+            cur_slot = kt % A_LDS_STAGES
+            wait_a_tile()
+            a_frags = preload_a(cur_slot)
+            if const_expr(kt + 1 < K_TILES_TOTAL):
+                next_base = k_base + fx.Int32((kt + 1) * TILE_K)
+                issue_a_tile(next_base, slot=(kt + 1) % A_LDS_STAGES)
+                b_nxt = [
+                    load_b_k32_pair(next_base, ku)
+                    for ku in range_constexpr(k_unroll - 1)
+                ]
+                compute_b_k32_pair(b_cur[0], a_frags, 0)
+                b_nxt.append(load_b_k32_pair(next_base, k_unroll - 1))
+                for ku in range_constexpr(1, k_unroll):
+                    compute_b_k32_pair(b_cur[ku], a_frags, ku)
+
+                # Pin the deferred pair after the first two MFMAs. Without an
+                # explicit schedule the backend may hoist it back into the
+                # six-load prefix and recreate the eight-VGPR live-range peak.
+                rocdl.sched_vmem(2 * (k_unroll - 1))
+                rocdl.sched_mfma(2)
+                rocdl.sched_vmem(2)
+                rocdl.sched_mfma(2 * (k_unroll - 1))
+                rocdl.sched_barrier(0)
+                b_cur = b_nxt
+            else:
+                for ku in range_constexpr(k_unroll):
+                    compute_b_k32_pair(b_cur[ku], a_frags, ku)
+                rocdl.sched_mfma(2 * k_unroll)
+                rocdl.sched_barrier(0)
+    elif const_expr(_DEFER_UP3):
+        # Keep all next-tile gate K32 loads early, together with only up K32=0.
+        # After consuming the current tile's first gate/up pair, issue the
+        # remaining three up loads. This preserves the gate prefetch path while
+        # retaining defer3's 14-live-B-operand peak (56 VGPR).
+        issue_a_tile(k_base, slot=0)
+        b_cur = [load_b_k32_pair(k_base, ku) for ku in range_constexpr(k_unroll)]
+        for kt in range_constexpr(K_TILES_TOTAL):
+            cur_slot = kt % A_LDS_STAGES
+            wait_a_tile()
+            a_frags = preload_a(cur_slot)
+            if const_expr(kt + 1 < K_TILES_TOTAL):
+                next_base = k_base + fx.Int32((kt + 1) * TILE_K)
+                issue_a_tile(next_base, slot=(kt + 1) % A_LDS_STAGES)
+                b_nxt_gate = [
+                    b_loader.load_raw_ku(next_base, cols_gate[0], ku)
+                    for ku in range_constexpr(k_unroll)
+                ]
+                b_nxt_up = [b_loader.load_raw_ku(next_base, cols_up[0], 0)]
+                compute_b_k32_pair(b_cur[0], a_frags, 0)
+                for ku in range_constexpr(1, k_unroll):
+                    b_nxt_up.append(
+                        b_loader.load_raw_ku(next_base, cols_up[0], ku)
+                    )
+                for ku in range_constexpr(1, k_unroll):
+                    compute_b_k32_pair(b_cur[ku], a_frags, ku)
+
+                rocdl.sched_vmem(k_unroll + 1)
+                rocdl.sched_mfma(2)
+                rocdl.sched_vmem(k_unroll - 1)
+                rocdl.sched_mfma(2 * (k_unroll - 1))
+                rocdl.sched_barrier(0)
+                b_cur = [
+                    (b_nxt_gate[ku], b_nxt_up[ku])
+                    for ku in range_constexpr(k_unroll)
+                ]
+            else:
+                for ku in range_constexpr(k_unroll):
+                    compute_b_k32_pair(b_cur[ku], a_frags, ku)
+                rocdl.sched_mfma(2 * k_unroll)
+                rocdl.sched_barrier(0)
+    elif const_expr(_RING4):
+        # Four K32 gate/up slots hold only the current tile. Refill a slot for
+        # tile kt+1 immediately after tile kt consumes it, allowing the same
+        # physical VGPRs to form a 4-slot software ring.
+        issue_a_tile(k_base, slot=0)
+        b_ring = [load_b_k32_pair(k_base, ku) for ku in range_constexpr(k_unroll)]
+        for kt in range_constexpr(K_TILES_TOTAL):
+            cur_slot = kt % A_LDS_STAGES
+            wait_a_tile()
+            a_frags = preload_a(cur_slot)
+            if const_expr(kt + 1 < K_TILES_TOTAL):
+                next_base = k_base + fx.Int32((kt + 1) * TILE_K)
+                issue_a_tile(next_base, slot=(kt + 1) % A_LDS_STAGES)
+            for ku in range_constexpr(k_unroll):
+                compute_b_k32_pair(b_ring[ku], a_frags, ku)
+                if const_expr(kt + 1 < K_TILES_TOTAL):
+                    b_ring[ku] = load_b_k32_pair(next_base, ku)
+            if const_expr(kt + 1 < K_TILES_TOTAL):
+                for _ in range_constexpr(k_unroll):
+                    rocdl.sched_mfma(2)
+                    rocdl.sched_vmem(2)
+            else:
+                rocdl.sched_mfma(2 * k_unroll)
+            rocdl.sched_barrier(0)
     else:
-        a_loader.store_tile(k_base, slot=0)
+        issue_a_tile(k_base, slot=0)
         b_cur = load_b_tile(k_base)
         for kt in range_constexpr(K_TILES_TOTAL):
             cur_slot = kt % A_LDS_STAGES
-            # Wait only THIS tile's A DMA (lgkmcnt); B's vmem stays in flight.
-            rocdl.s_waitcnt(0xC07F)
-            gpu.barrier()  # single barrier: A(kt) visible before ds_read
+            wait_a_tile()
             # Phase-separated: read resident A-LDS, THEN issue kt+1's A-DMA + B/B-scale
             # so they overlap the MFMA cluster.
             a_frags = preload_a(cur_slot)
             if const_expr(kt + 1 < K_TILES_TOTAL):
-                a_loader.store_tile(
+                issue_a_tile(
                     k_base + fx.Int32((kt + 1) * TILE_K), slot=(kt + 1) % A_LDS_STAGES
                 )
                 b_nxt = load_b_tile(k_base + fx.Int32((kt + 1) * TILE_K))
             compute_tile(b_cur, a_frags)
             if const_expr(kt + 1 < K_TILES_TOTAL):
                 b_cur = b_nxt
+    if const_expr(grid_split_k > 1):
+        _is_primary = wave_k_id == fx.Int32(0)
+
+        def _store_split_partials(primary_is_proven):
+            for mi in range_constexpr(m_repeat):
+                for ii in range_constexpr(4):
+                    row_in_tile = (
+                        fx.Int32(mi * 16)
+                        + lane_div_16 * fx.Int32(4)
+                        + fx.Int32(ii)
+                    )
+                    if const_expr(identity_m_indices):
+                        token = row_in_tile
+                    else:
+                        fused = fx.Int32(_global_i32_at(arg_mind, row_in_tile))
+                        token = fused & fx.Int32(0x00FFFFFF)
+                    valid = token < i32_ntok
+                    if not primary_is_proven:
+                        valid = valid & _is_primary
+                    for ni in range_constexpr(num_acc_n):
+                        col = col_g_list[ni]
+                        g = fx.Float32(
+                            fx.Vector(fx.memref_load_vec(acc_gate[mi][ni]))[ii]
+                        )
+                        u = fx.Float32(
+                            fx.Vector(fx.memref_load_vec(acc_up[mi][ni]))[ii]
+                        )
+                        if const_expr(vec2_partials):
+                            pair_idx = (
+                                (
+                                    token * fx.Int32(grid_split_k) + split_id
+                                )
+                                * inter_i32
+                                + col
+                            ) * fx.Int32(2)
+                            pair = Vec.from_elements([g, u], fx.Float32)
+                            buffer_ops.buffer_store(
+                                pair,
+                                _raw(split_workspace_rsrc),
+                                _raw(pair_idx),
+                                mask=valid,
+                                cache_modifier=CPOL_COHERENT,
+                            )
+                        else:
+                            gate_idx = (
+                                (
+                                    (token * fx.Int32(2))
+                                    * fx.Int32(grid_split_k)
+                                    + split_id
+                                )
+                                * inter_i32
+                                + col
+                            )
+                            up_idx = gate_idx + fx.Int32(grid_split_k * INTER)
+                            buffer_ops.buffer_store(
+                                g,
+                                _raw(split_workspace_rsrc),
+                                _raw(gate_idx),
+                                mask=valid,
+                                cache_modifier=CPOL_COHERENT,
+                            )
+                            buffer_ops.buffer_store(
+                                u,
+                                _raw(split_workspace_rsrc),
+                                _raw(up_idx),
+                                mask=valid,
+                                cache_modifier=CPOL_COHERENT,
+                            )
+
     # ---- k_wave slice-K reduce (aiter mixed_moe LDS-reduce): each wave stores its
     # nm = num_acc_n*m_repeat vec4-f32 acc-slots to a per-wave LDS region, then sums its
-    # peers' (peer = g*num_n_waves + wave_n_id) partials. Gate/up reduced in SEPARATE
-    # rounds to halve peak LDS scratch (kw4@tile_n=256 else overruns 160KB).
+    # peers' (peer = g*num_n_waves + wave_n_id) partials. The fused experiment keeps
+    # gate/up in separate planes so both reduce under one barrier pair.
     if const_expr(k_wave > 1):
         nm = num_acc_n * m_repeat
         grp_stride = 64 * nm * 4  # f32 elems per wave (vec4 per lane per acc-slot)
@@ -346,30 +743,248 @@ def _gemm1_body_a16w4(
                     )
                 acc.store(s)
 
-        _reduce_round(acc_gate)
-        _reduce_round(acc_up)
+        if const_expr(shared_fused_reduce):
+            # Both supported profiles need 4 KiB per plane. They fit in the
+            # existing A-LDS arena after the K loop, avoiding the barrier pair
+            # previously needed before reusing one plane for up.
+            plane_stride = num_waves * grp_stride
+            gpu.barrier()
+            my_base = wave * fx.Int32(grp_stride) + lane * fx.Int32(4)
+            for ai in range_constexpr(nm):
+                gate_v = Vec(
+                    fx.memref_load_vec(acc_gate[ai // num_acc_n][ai % num_acc_n])
+                )
+                up_v = Vec(
+                    fx.memref_load_vec(acc_up[ai // num_acc_n][ai % num_acc_n])
+                )
+                gate_idx = my_base + fx.Int32(ai * 64 * 4)
+                up_idx = gate_idx + fx.Int32(plane_stride)
+                for vv in range_constexpr(4):
+                    lds_scr[gate_idx + fx.Int32(vv)] = fx.Float32(gate_v[vv])
+                    lds_scr[up_idx + fx.Int32(vv)] = fx.Float32(up_v[vv])
+            gpu.barrier()
 
-    # ---- epilogue: SiLU(gate)*up -> bf16 intermediate [sorted_size, inter] -----
-    # Stored by SORTED POSITION (row = bx_m + row_in_tile). Padding rows (token >=
-    # tokens) masked out; for k_wave>1 only the primary k-group (wave_k_id==0) writes.
-    if const_expr(k_wave > 1):
-        _is_primary = wave_k_id == fx.Int32(0)
-    for mi in range_constexpr(m_repeat):
-        for ii in range_constexpr(4):
-            row_in_tile = fx.Int32(mi * 16) + lane_div_16 * fx.Int32(4) + fx.Int32(ii)
-            sorted_row = bx_m + row_in_tile
-            fused = fx.Int32(_global_i32_at(arg_mind, sorted_row))
-            token = fused & fx.Int32(0x00FFFFFF)
-            valid = token < i32_ntok
-            if const_expr(k_wave > 1):
-                valid = valid & _is_primary
-            for ni in range_constexpr(num_acc_n):
-                g = fx.Float32(fx.Vector(fx.memref_load_vec(acc_gate[mi][ni]))[ii])
-                u = fx.Float32(fx.Vector(fx.memref_load_vec(acc_up[mi][ni]))[ii])
-                y = gate_up_act(act, [g], [u], situ)[0]
-                yb = y.to(fx.BFloat16)
-                out_idx = sorted_row * inter_i32 + col_g_list[ni]
-                buffer_ops.buffer_store(yb, _raw(out_rsrc), _raw(out_idx), mask=valid)
+            primary_if = scf.IfOp(
+                _raw(_is_primary), results_=[], has_else=False
+            )
+            with ir.InsertionPoint(primary_if.then_block):
+                for ai in range_constexpr(nm):
+                    ai_off = fx.Int32(ai * 64 * 4) + lane * fx.Int32(4)
+                    gate_acc = acc_gate[ai // num_acc_n][ai % num_acc_n]
+                    up_acc = acc_up[ai // num_acc_n][ai % num_acc_n]
+                    gate_sum = Vec(fx.memref_load_vec(gate_acc))
+                    up_sum = Vec(fx.memref_load_vec(up_acc))
+                    for g in range_constexpr(1, k_wave):
+                        peer = fx.Int32(g * num_n_waves) + wave_n_id
+                        peer_idx = peer * fx.Int32(grp_stride) + ai_off
+                        peer_gate = Vec(
+                            lds_vec_load(
+                                lds_scr_i32,
+                                peer_idx * fx.Int32(4),
+                                Vec.make_type(4, fx.Float32),
+                                fx.Float32,
+                                align=8,
+                            )
+                        )
+                        peer_up = Vec(
+                            lds_vec_load(
+                                lds_scr_i32,
+                                (peer_idx + fx.Int32(plane_stride)) * fx.Int32(4),
+                                Vec.make_type(4, fx.Float32),
+                                fx.Float32,
+                                align=8,
+                            )
+                        )
+                        gate_sum = Vec.from_elements(
+                            [
+                                gate_sum[vv] + peer_gate[vv]
+                                for vv in range_constexpr(4)
+                            ],
+                            fx.Float32,
+                        )
+                        up_sum = Vec.from_elements(
+                            [
+                                up_sum[vv] + peer_up[vv]
+                                for vv in range_constexpr(4)
+                            ],
+                            fx.Float32,
+                        )
+                    gate_acc.store(gate_sum)
+                    up_acc.store(up_sum)
+                _store_split_partials(primary_is_proven=True)
+                scf.YieldOp([])
+        else:
+            _reduce_round(acc_gate)
+            _reduce_round(acc_up)
+
+    # ---- epilogue -------------------------------------------------------------
+    # Ordinary kernels activate and store BF16 directly.  The Kimi shared
+    # grid-split specialization writes coherent FP32 gate/up planes, then the
+    # last split arriving for an N tile reduces them and applies SiTUv2.  This
+    # keeps producer, completion, and the routed path in one dispatch.
+    if const_expr(grid_split_k > 1):
+        if const_expr(not shared_fused_reduce):
+            _store_split_partials(primary_is_proven=False)
+
+        # The coherent stores plus wait are the release.  All lanes rendezvous
+        # before lane 0 publishes this producer's arrival.
+        rocdl.s_waitcnt(0)
+        gpu.barrier()
+        tx_i32 = fx.Int32(gpu.thread_id("x"))
+        split_flag_ptr = lds_typed_ptr(
+            fx.Int32(fx.ptrtoint(lds_raw_ptr)), T.i32, align=4
+        )
+        semaphore_addr = (
+            fx.Int64(arg_split_semaphore)
+            + fx.Int64(n_block_idx) * fx.Int64(4)
+        )
+        arrival_if = scf.IfOp(
+            _raw(tx_i32 == fx.Int32(0)), results_=[], has_else=False
+        )
+        with ir.InsertionPoint(arrival_if.then_block):
+            arrival = fx.Int32(
+                comm_ops.atomic_add_agent(semaphore_addr, fx.Int32(1))
+            )
+            is_last = (arrival == fx.Int32(grid_split_k - 1)).select(
+                fx.Int32(1), fx.Int32(0)
+            )
+            fx.ptr_store(Vec.from_elements([is_last], fx.Int32), split_flag_ptr)
+            scf.YieldOp([])
+        gpu.barrier()
+
+        is_last = Vec(
+            fx.make_view(split_flag_ptr, fx.make_layout(1, 1)).load()
+        )[0]
+        completion_if = scf.IfOp(
+            _raw(is_last != fx.Int32(0)), results_=[], has_else=False
+        )
+        with ir.InsertionPoint(completion_if.then_block):
+            # Each thread keeps only two scalar accumulators live so
+            # the routed branch does not inherit a large VGPR footprint.
+            completion_elems = 8 * TILE_N
+            workgroup_threads = num_waves * 64
+            completion_passes = (
+                completion_elems + workgroup_threads - 1
+            ) // workgroup_threads
+            for completion_pass in range_constexpr(completion_passes):
+                reduce_linear = tx_i32 + fx.Int32(
+                    completion_pass * workgroup_threads
+                )
+                reduce_row = reduce_linear // fx.Int32(TILE_N)
+                reduce_col = reduce_linear % fx.Int32(TILE_N)
+                reduce_valid = (reduce_linear < fx.Int32(completion_elems)) & (
+                    reduce_row < i32_ntok
+                )
+                global_col = n_block_idx * fx.Int32(TILE_N) + reduce_col
+                gate_sum = fx.Float32(0.0)
+                up_sum = fx.Float32(0.0)
+                for split in range_constexpr(grid_split_k):
+                    if const_expr(vec2_partials):
+                        pair_idx = (
+                            (
+                                reduce_row * fx.Int32(grid_split_k)
+                                + fx.Int32(split)
+                            )
+                            * inter_i32
+                            + global_col
+                        ) * fx.Int32(2)
+                        pair = Vec(
+                            buffer_ops.buffer_load(
+                                _raw(split_workspace_rsrc),
+                                _raw(pair_idx),
+                                vec_width=2,
+                                dtype=T.f32,
+                                mask=reduce_valid,
+                                cache_modifier=CPOL_COHERENT,
+                            )
+                        )
+                        gate_sum = gate_sum + fx.Float32(pair[0])
+                        up_sum = up_sum + fx.Float32(pair[1])
+                    else:
+                        gate_idx = (
+                            (
+                                (reduce_row * fx.Int32(2))
+                                * fx.Int32(grid_split_k)
+                                + fx.Int32(split)
+                            )
+                            * inter_i32
+                            + global_col
+                        )
+                        up_idx = gate_idx + fx.Int32(grid_split_k * INTER)
+                        gate_sum = gate_sum + fx.Float32(
+                            buffer_ops.buffer_load(
+                                _raw(split_workspace_rsrc),
+                                _raw(gate_idx),
+                                vec_width=1,
+                                dtype=T.f32,
+                                mask=reduce_valid,
+                                cache_modifier=CPOL_COHERENT,
+                            )
+                        )
+                        up_sum = up_sum + fx.Float32(
+                            buffer_ops.buffer_load(
+                                _raw(split_workspace_rsrc),
+                                _raw(up_idx),
+                                vec_width=1,
+                                dtype=T.f32,
+                                mask=reduce_valid,
+                                cache_modifier=CPOL_COHERENT,
+                            )
+                        )
+                y = gate_up_act(act, [gate_sum], [up_sum], situ)[0]
+                out_idx = reduce_row * inter_i32 + global_col
+                buffer_ops.buffer_store(
+                    y.to(fx.BFloat16),
+                    _raw(out_rsrc),
+                    _raw(out_idx),
+                    mask=reduce_valid,
+                )
+
+            rocdl.s_waitcnt(0)
+            gpu.barrier()
+            reset_if = scf.IfOp(
+                _raw(tx_i32 == fx.Int32(0)), results_=[], has_else=False
+            )
+            with ir.InsertionPoint(reset_if.then_block):
+                # Atomic subtraction cannot clobber an early increment from a
+                # future replay; same-stream kernel ordering keeps replays apart.
+                comm_ops.atomic_add_agent(
+                    semaphore_addr, fx.Int32(-grid_split_k)
+                )
+                scf.YieldOp([])
+            scf.YieldOp([])
+    else:
+        # SiLU/SiTUv2 -> BF16 intermediate [sorted_size, inter].  Stored by
+        # sorted position; padding rows are masked.  For intra-WG slice-K only
+        # the primary K group writes after the LDS reduction.
+        if const_expr(k_wave > 1):
+            _is_primary = wave_k_id == fx.Int32(0)
+        for mi in range_constexpr(m_repeat):
+            for ii in range_constexpr(4):
+                row_in_tile = (
+                    fx.Int32(mi * 16)
+                    + lane_div_16 * fx.Int32(4)
+                    + fx.Int32(ii)
+                )
+                sorted_row = bx_m + row_in_tile
+                fused = fx.Int32(_global_i32_at(arg_mind, sorted_row))
+                token = fused & fx.Int32(0x00FFFFFF)
+                valid = token < i32_ntok
+                if const_expr(k_wave > 1):
+                    valid = valid & _is_primary
+                for ni in range_constexpr(num_acc_n):
+                    g = fx.Float32(
+                        fx.Vector(fx.memref_load_vec(acc_gate[mi][ni]))[ii]
+                    )
+                    u = fx.Float32(
+                        fx.Vector(fx.memref_load_vec(acc_up[mi][ni]))[ii]
+                    )
+                    y = gate_up_act(act, [g], [u], situ)[0]
+                    yb = y.to(fx.BFloat16)
+                    out_idx = sorted_row * inter_i32 + col_g_list[ni]
+                    buffer_ops.buffer_store(
+                        yb, _raw(out_rsrc), _raw(out_idx), mask=valid
+                    )
 
 
 def gemm1_a16w4_grid(BM, *, INTER, TILE_N, max_m_blocks):

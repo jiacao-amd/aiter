@@ -35,4 +35,6 @@ def moe_sorting_opus_fwd(
     local_topk_ids: torch.Tensor | None = None,
     m_indices: torch.Tensor | None = None,
     reverse_sorted: torch.Tensor | None = None,
+    fused_routed_x: torch.Tensor | None = None,
+    fused_routed_x_fp8: torch.Tensor | None = None,
 ) -> None: ...
