@@ -52,7 +52,7 @@ def _measure(fn, warmup: int, iterations: int, samples: int) -> list[float]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tokens", type=int, default=1, choices=(1, 2, 3, 4))
+    parser.add_argument("--tokens", type=int, default=1, choices=range(1, 33))
     parser.add_argument("--experts", type=int, default=16)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=50)
@@ -125,10 +125,14 @@ def main() -> None:
         shared_w1, shared_w2
     )
 
-    selected = torch.randperm(E, device="cuda", dtype=torch.int64)[:KIMI_K3_TOPK].to(
-        torch.int32
-    )
-    topk_ids = selected.repeat(M, 1)
+    # Use an independent top-k set per token.  Repeating one set makes E=896
+    # behave like E=16 and hides capacity-sized-grid regressions.
+    topk_ids = torch.stack(
+        [
+            torch.randperm(E, device="cuda", dtype=torch.int64)[:KIMI_K3_TOPK]
+            for _ in range(M)
+        ]
+    ).to(torch.int32)
     topk_weights = torch.softmax(
         torch.randn((M, KIMI_K3_TOPK), dtype=torch.float32, device="cuda"),
         dim=-1,
@@ -148,6 +152,8 @@ def main() -> None:
         32,
         accumulate=True,
     )
+    capacity_blocks = int(sorted_expert_ids.numel())
+    active_block_bound = min(M * KIMI_K3_TOPK, E, capacity_blocks)
 
     workspace = create_kimi_k3_fhmoe_workspace(
         max_sorted_tokens=sorted_token_ids.numel(),
@@ -250,6 +256,10 @@ def main() -> None:
     separate_med = statistics.median(separate_us)
     fused_med = statistics.median(fused_us)
     print(f"Kimi-K3 FHMoE core M={M}, E={E}, topk={KIMI_K3_TOPK}")
+    print(
+        "routed block grid: "
+        f"capacity={capacity_blocks}, active_bound={active_block_bound}"
+    )
     print(f"routed two-stage: {routed_med:.3f} us")
     print(f"shared Torch:     {shared_med:.3f} us")
     print(f"separate total:   {separate_med:.3f} us")

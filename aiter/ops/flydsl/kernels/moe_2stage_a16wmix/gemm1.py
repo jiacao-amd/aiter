@@ -45,6 +45,7 @@ def _gemm1_body_a16w4(
     situ,
     *,
     BM,
+    SORT_BM,
     TILE_N,
     TILE_K,
     K,
@@ -106,7 +107,10 @@ def _gemm1_body_a16w4(
     n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
     m_block_idx = bx_i32 // fx.Int32(NUM_N_BLOCKS)
     e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block_idx)))
-    bx_m = m_block_idx * fx.Int32(BM)  # first sorted row of this m-block
+    # The compute tile may be narrower than the fixed-width sorting block.  Kimi
+    # decode uses BM=16 for M<=16 while moe_sorting continues to lay out every
+    # expert at SORT_BM=32 rows, so sorted-row addressing must not use BM.
+    bx_m = m_block_idx * fx.Int32(SORT_BM)
     by_n = n_block_idx * fx.Int32(TILE_N)
     inter_i32 = fx.Int32(INTER)
 
@@ -126,6 +130,7 @@ def _gemm1_body_a16w4(
         w_dtype=w_dtype,
         b_cache_mod=b_cache_mod,
         use_k16=use_k16,
+        bf16_layout=("rowmajor" if w_layout == "rowmajor" else "preshuffled"),
     )
     # Intermediate [sorted_size, inter] bf16: num_records = cumsum0*inter*2, so masked
     # (clamped) stores land OOB. KEPT RAW: the output resource + masked buffer_store need a
@@ -403,8 +408,10 @@ def compile_gemm1_a16w4_port(
     ``w_layout="standard"`` (default) consumes the N-major GGUU preshuffle.
     ``"guinterleave"`` (mxfp4 only) consumes aiter's native GUGU stage1 W1+scale layout
     (``shuffle_weight_a16w4``/``shuffle_scale_a16w4``, ``is_guinterleave=True``) directly,
-    no host relayout. Stage2 (gemm2) needs no mode: its gate_up=False native layout is
-    byte-identical to standard when E*model_dim % 256 == 0.
+    no host relayout. ``"rowmajor"`` (bf16 only) consumes the model's native
+    ``[N_OUT, K]`` matrix without a persistent shuffled copy. Stage2 (gemm2) needs no
+    mode: its gate_up=False native layout is byte-identical to standard when
+    E*model_dim % 256 == 0.
 
     ``k_wave`` (aiter slice-K, default 1): repartition 4 waves into (4/k_wave) N-waves x
     k_wave K-waves; partials LDS-reduced. k_wave in {1,2,4}; requires 4 % k_wave == 0 and
@@ -418,10 +425,14 @@ def compile_gemm1_a16w4_port(
     assert w_layout in (
         "standard",
         "guinterleave",
-    ), f"w_layout must be 'standard' or 'guinterleave', got {w_layout!r}"
+        "rowmajor",
+    ), f"unsupported w_layout {w_layout!r}"
     assert not (
         w_layout == "guinterleave" and w_dtype != "fp4"
     ), f"w_layout='guinterleave' is mxfp4-only, got w_dtype={w_dtype!r}"
+    assert not (
+        w_layout == "rowmajor" and w_dtype != "bf16"
+    ), f"w_layout='rowmajor' is bf16-only, got w_dtype={w_dtype!r}"
     assert k_wave in (1, 2, 4), f"k_wave must be 1, 2, or 4, got {k_wave}"
     assert 4 % k_wave == 0, f"4 must be divisible by k_wave, got {k_wave}"
     _K = D_HIDDEN
@@ -562,6 +573,7 @@ def compile_gemm1_a16w4_port(
                 i32_ntok,
                 _situ,
                 BM=BM,
+                SORT_BM=BM,
                 TILE_N=TILE_N,
                 TILE_K=TILE_K,
                 K=_K,

@@ -428,6 +428,7 @@ def make_b_loader(
     w_dtype,
     b_cache_mod,
     use_k16,
+    bf16_layout="preshuffled",
 ):
     """Build the shared B (weight) operand path for gemm1 and gemm2.
 
@@ -441,7 +442,9 @@ def make_b_loader(
       ``"fp4"``  mxfp4 W + e8m0 per-1x32 scale
       ``"int4"`` OLD-kernel packed int4 W + (E, G//2, N, 2) bf16 groupwise scale
       ``"bf16"`` raw bf16 W (no scale, no upconvert; ``load_scale`` yields all-None and
-                 ``upconvert`` returns the loaded fragment unchanged)
+                 ``upconvert`` returns the loaded fragment unchanged). ``bf16_layout``
+                 selects the legacy N-major preshuffle or the model's native row-major
+                 ``[N_OUT, K]`` layout.
 
     ``expert_off``/``inter``-style N arithmetic stays with the caller: it hands ``col``
     the 16-wide N block base and gets back everything the loaders need.
@@ -454,6 +457,11 @@ def make_b_loader(
     """
     _is_int4 = w_dtype == "int4"
     _is_bf16 = w_dtype == "bf16"
+    assert bf16_layout in (
+        "preshuffled",
+        "rowmajor",
+    ), f"bf16_layout must be 'preshuffled' or 'rowmajor', got {bf16_layout!r}"
+    _is_bf16_rowmajor = _is_bf16 and bf16_layout == "rowmajor"
     # Emitted before the layouts/resources below: this is where the stages used to
     # compute it, and the ISA is sensitive to the order operands are materialized in.
     expert_off = e * fx.Int32(N_OUT)
@@ -672,21 +680,34 @@ def make_b_loader(
         raw = []
         base_k0 = base_k // fx.Int32(32)
         for ku in range_constexpr(k_unroll):
-            _k0_blk = ku // 4
-            bf_k0 = base_k0 + fx.Int32(_k0_blk * 4) + lane_div_16
-            bf_klane = fx.Int32(ku % 4)
-            elem_idx = fx.Int32(
-                crd2idx(
-                    [
-                        fx.Int64(n_blk),
-                        fx.Int64(bf_k0),
-                        fx.Int64(bf_klane),
-                        fx.Int64(n_intra),
-                        fx.Int64(0),
-                    ],
-                    layout_b_bf16,
+            if const_expr(_is_bf16_rowmajor):
+                # Native model layout [N_OUT, K].  A lane owns one N row and
+                # loads the eight consecutive K values forming its MFMA-K32 B
+                # fragment.  The K mapping is identical to the preshuffled
+                # path below, only the global-memory address changes.
+                row = n_blk * fx.Int32(16) + n_intra
+                elem_idx = (
+                    row * fx.Int32(K)
+                    + base_k
+                    + fx.Int32((ku // 4) * 128 + (ku % 4) * 8)
+                    + lane_div_16 * fx.Int32(32)
                 )
-            )
+            else:
+                _k0_blk = ku // 4
+                bf_k0 = base_k0 + fx.Int32(_k0_blk * 4) + lane_div_16
+                bf_klane = fx.Int32(ku % 4)
+                elem_idx = fx.Int32(
+                    crd2idx(
+                        [
+                            fx.Int64(n_blk),
+                            fx.Int64(bf_k0),
+                            fx.Int64(bf_klane),
+                            fx.Int64(n_intra),
+                            fx.Int64(0),
+                        ],
+                        layout_b_bf16,
+                    )
+                )
             # elem_idx is a bf16-elem offset; dword index = elem_idx*2/4, tile idx = /4.
             r = fx.make_rmem_tensor(w_reg_lay, fx.Int32)
             fx.copy(w_copy_atom, fx.slice(w_tiles, (None, elem_idx // fx.Int32(8))), r)

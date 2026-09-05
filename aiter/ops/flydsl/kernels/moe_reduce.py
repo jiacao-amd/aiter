@@ -17,6 +17,7 @@ contiguous ``X[tokens, topk, model_dim]`` tensor.
 """
 
 import functools
+import types
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -29,8 +30,7 @@ BLOCK = 256
 FP8_VEC = 8  # fp8 values per 64b buffer load (also the store granularity)
 
 
-@flyc.kernel
-def moe_reduction_kernel(
+def _moe_reduction_body(
     X: fx.Pointer,
     Y: fx.Pointer,
     expert_mask: fx.Pointer,
@@ -194,6 +194,27 @@ def moe_reduction_kernel(
         _reduce_tile()
 
 
+def _build_moe_reduction_kernel(block: int):
+    """Build a reduction kernel whose AMDGPU workgroup metadata matches launch."""
+
+    # KernelFunction's AST rewriter mutates the decorated function's code.
+    # Clone the pristine body so each workgroup-size specialization is fully
+    # rewritten without modifying the source used by another cached shape.
+    kernel_func = types.FunctionType(
+        _moe_reduction_body.__code__,
+        _moe_reduction_body.__globals__,
+        name=_moe_reduction_body.__name__,
+        argdefs=_moe_reduction_body.__defaults__,
+        closure=_moe_reduction_body.__closure__,
+    )
+    kernel_func.__annotations__ = dict(_moe_reduction_body.__annotations__)
+    kernel_func.__kwdefaults__ = _moe_reduction_body.__kwdefaults__
+    return flyc.kernel(
+        name=f"moe_reduction_kernel_{block}",
+        known_block_size=[block, 1, 1],
+    )(kernel_func)
+
+
 def _pick_reduce_block(model_dim: int, V: int) -> int:
     need = -(-model_dim // V)
     block = BLOCK
@@ -236,6 +257,7 @@ def compile_moe_reduction(
         )
     else:
         scale_blk, fp8_row_stride = FP8_VEC, model_dim
+    moe_reduction_kernel = _build_moe_reduction_kernel(block)
 
     @flyc.jit
     def launch(

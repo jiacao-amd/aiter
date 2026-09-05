@@ -23,10 +23,84 @@ from .kernels.kimi_k3_fhmoe_a16w4 import (
     compile_kimi_k3_fhmoe_stage2,
 )
 
-KIMI_K3_BLOCK_M = 32
-KIMI_K3_MAX_DECODE_TOKENS = KIMI_K3_BLOCK_M
+KIMI_K3_SORT_BLOCK_M = 32
+# Backward-compatible public name: sorting/workspace rows remain fixed at 32.
+KIMI_K3_BLOCK_M = KIMI_K3_SORT_BLOCK_M
+KIMI_K3_MAX_DECODE_TOKENS = KIMI_K3_SORT_BLOCK_M
 _STAGE1_TILE_N = 128
 _STAGE2_TILE_N = 128
+_GFX950_CU_COUNT = 256
+
+
+def _routed_grid_block_upper_bound(
+    tokens: int,
+    num_experts: int,
+    capacity_blocks: int,
+) -> int:
+    """Bound active routed blocks for decode shapes with tokens <= BLOCK_M."""
+    return min(tokens * KIMI_K3_TOPK, num_experts, capacity_blocks)
+
+
+def _decode_compute_block_m(tokens: int) -> int:
+    """Use a half-height compute tile when no expert can receive over 16 routes."""
+    if not 1 <= tokens <= KIMI_K3_MAX_DECODE_TOKENS:
+        raise ValueError(
+            f"tokens must be in [1, {KIMI_K3_MAX_DECODE_TOKENS}], got {tokens}"
+        )
+    return 16 if tokens <= 16 else KIMI_K3_SORT_BLOCK_M
+
+
+def _decode_kernel_profile(tokens: int) -> dict[str, int | bool | None]:
+    """Kimi-K3 A16W4 settings mirrored from the gfx950 tuned-FMoE rows."""
+    if tokens <= 1:
+        return dict(
+            s1_tn=32, s1_tk=256, s1_wpe=4, s1_xcd=4, s1_kw=2,
+            s2_tn=128, s2_tk=128, s2_bcm=2, s2_xcd=4, s2_persist=False,
+        )
+    if tokens <= 2:
+        return dict(
+            s1_tn=32, s1_tk=128, s1_wpe=4, s1_xcd=0, s1_kw=4,
+            s2_tn=128, s2_tk=128, s2_bcm=2, s2_xcd=0, s2_persist=False,
+        )
+    if tokens <= 4:
+        return dict(
+            s1_tn=32, s1_tk=256, s1_wpe=4, s1_xcd=4, s1_kw=2,
+            s1_rbcm=2, s1_sbcm=0,
+            s1_stn=32, s1_stk=256, s1_skw=2,
+            s2_tn=128, s2_tk=128, s2_bcm=2, s2_xcd=4, s2_persist=False,
+            s2_rbcm=2, s2_sbcm=2, s2_stn=64, s2_stk=128,
+        )
+    if tokens <= 8:
+        return dict(
+            s1_tn=32, s1_tk=256, s1_wpe=4, s1_xcd=4, s1_kw=2,
+            s1_rbcm=2, s1_sbcm=0,
+            s1_stn=32, s1_stk=256, s1_skw=2,
+            s2_tn=128, s2_tk=128, s2_bcm=3, s2_xcd=0, s2_persist=False,
+            s2_rbcm=3, s2_sbcm=3, s2_stn=64, s2_stk=128,
+        )
+    if tokens <= 9:
+        return dict(
+            s1_tn=64, s1_tk=256, s1_wpe=3, s1_xcd=4, s1_kw=2,
+            s1_rbcm=3, s1_sbcm=3,
+            s1_stn=32, s1_stk=256, s1_skw=2,
+            s2_tn=128, s2_tk=128, s2_bcm=2, s2_xcd=4, s2_persist=False,
+            s2_rbcm=3, s2_sbcm=0, s2_stn=64, s2_stk=128,
+        )
+    if tokens <= 21:
+        return dict(
+            s1_tn=64, s1_tk=256, s1_wpe=4, s1_xcd=0, s1_kw=2,
+            s1_rbcm=2, s1_sbcm=2,
+            s1_stn=32, s1_stk=256, s1_skw=2,
+            s2_tn=256, s2_tk=128, s2_bcm=2, s2_xcd=0, s2_persist=False,
+            s2_rbcm=2, s2_sbcm=2, s2_stn=64, s2_stk=128,
+        )
+    return dict(
+        s1_tn=128, s1_tk=256, s1_wpe=3, s1_xcd=4, s1_kw=1,
+        s1_rbcm=2, s1_sbcm=3,
+        s1_stn=32, s1_stk=256, s1_skw=2,
+        s2_tn=256, s2_tk=128, s2_bcm=0, s2_xcd=4, s2_persist=False,
+        s2_rbcm=3, s2_sbcm=3, s2_stn=64, s2_stk=128,
+    )
 
 
 @dataclass
@@ -108,6 +182,11 @@ def create_kimi_k3_fhmoe_workspace(
                 device=device,
             )
 
+    shared_cumsum = torch.full(
+        (2,), KIMI_K3_BLOCK_M, dtype=torch.int32, device=device
+    )
+    shared_cumsum[1].fill_(max_tokens)
+
     return KimiK3FHMoEWorkspace(
         routed_inter=torch.empty(
             (max_sorted_tokens, KIMI_K3_ROUTED_INTER),
@@ -120,9 +199,7 @@ def create_kimi_k3_fhmoe_workspace(
             device=device,
         ),
         shared_expert_ids=torch.zeros(1, dtype=torch.int32, device=device),
-        shared_cumsum=torch.tensor(
-            [KIMI_K3_BLOCK_M, max_tokens], dtype=torch.int32, device=device
-        ),
+        shared_cumsum=shared_cumsum,
         shared_m_indices=shared_m_indices,
         max_tokens=max_tokens,
         num_experts=num_experts,
@@ -206,11 +283,13 @@ def _validate_launch_contract(
     sorted_expert_ids: torch.Tensor,
     cumsum_tensor: torch.Tensor,
     workspace: KimiK3FHMoEWorkspace,
+    shared_weight_layout: str,
 ) -> tuple[int, int]:
     M = routed_x.shape[0] if routed_x.ndim == 2 else -1
     if not 1 <= M <= KIMI_K3_MAX_DECODE_TOKENS:
         raise ValueError(
-            f"Kimi FHMoE decode kernel supports M=1..4, got shape {routed_x.shape}"
+            "Kimi FHMoE decode kernel supports "
+            f"M=1..{KIMI_K3_MAX_DECODE_TOKENS}, got shape {routed_x.shape}"
         )
     if tuple(routed_x.shape) != (M, KIMI_K3_ROUTED_HIDDEN):
         raise ValueError(
@@ -258,6 +337,11 @@ def _validate_launch_contract(
         raise ValueError("routed_w2_scale must use E8M0/uint8 storage")
 
     _validate_shared_weights(shared_w1, shared_w2, preshuffled=False)
+    if shared_weight_layout not in ("preshuffled", "rowmajor"):
+        raise ValueError(
+            "shared_weight_layout must be 'preshuffled' or 'rowmajor', got "
+            f"{shared_weight_layout!r}"
+        )
     tensors = (
         routed_w1,
         routed_w2,
@@ -319,6 +403,7 @@ def kimi_k3_fhmoe_a16w4_from_sorted(
     situ_beta: float = 4.0,
     situ_linear_beta: float = 25.0,
     swiglu_limit: float = float("inf"),
+    shared_weight_layout: str = "preshuffled",
     stream=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the two unified compute launches using precomputed routing metadata.
@@ -341,6 +426,7 @@ def kimi_k3_fhmoe_a16w4_from_sorted(
         sorted_expert_ids,
         cumsum_tensor,
         workspace,
+        shared_weight_layout,
     )
     if tuple(routed_out.shape) != (M, KIMI_K3_ROUTED_HIDDEN):
         raise ValueError(
@@ -369,13 +455,49 @@ def kimi_k3_fhmoe_a16w4_from_sorted(
     if stream is None:
         stream = torch.cuda.current_stream(routed_x.device)
     use_k16 = "gfx95" not in str(get_rocm_arch())
+    profile = _decode_kernel_profile(M)
+    if shared_weight_layout == "rowmajor":
+        profile.update(
+            s1_sbcm=1,
+            s1_stn=16,
+            s1_stk=128,
+            s1_skw=4,
+            s1_sfirst=True,
+            s2_sbcm=1,
+            s2_stn=64,
+            s2_stk=128,
+            s2_sfirst=True,
+        )
+    compute_bm = _decode_compute_block_m(M)
 
-    routed_max_blocks = int(sorted_expert_ids.numel())
-    stage1_grid = (
-        routed_max_blocks * (KIMI_K3_ROUTED_INTER // _STAGE1_TILE_N)
-        + KIMI_K3_SHARED_INTER // _STAGE1_TILE_N
+    routed_max_blocks = _routed_grid_block_upper_bound(
+        tokens=M,
+        num_experts=NE,
+        capacity_blocks=int(sorted_expert_ids.numel()),
     )
-    stage1 = compile_kimi_k3_fhmoe_stage1(NE=NE, use_k16=use_k16)
+    stage1_grid = (
+        routed_max_blocks * (KIMI_K3_ROUTED_INTER // int(profile["s1_tn"]))
+        + KIMI_K3_SHARED_INTER
+        // int(profile.get("s1_stn", profile["s1_tn"]))
+    )
+    stage1 = compile_kimi_k3_fhmoe_stage1(
+        NE=NE,
+        BM=compute_bm,
+        SORT_BM=KIMI_K3_SORT_BLOCK_M,
+        TILE_N=int(profile["s1_tn"]),
+        TILE_K=int(profile["s1_tk"]),
+        waves_per_eu=profile["s1_wpe"],
+        routed_b_cache_mod=int(profile.get("s1_rbcm", 2)),
+        shared_b_cache_mod=int(profile.get("s1_sbcm", 0)),
+        use_k16=use_k16,
+        shared_weight_layout=shared_weight_layout,
+        routed_xcd_swizzle=int(profile["s1_xcd"]),
+        routed_k_wave=int(profile["s1_kw"]),
+        shared_tile_n=int(profile.get("s1_stn", profile["s1_tn"])),
+        shared_tile_k=int(profile.get("s1_stk", profile["s1_tk"])),
+        shared_k_wave=int(profile.get("s1_skw", profile["s1_kw"])),
+        shared_first=bool(profile.get("s1_sfirst", False)),
+    )
     _run_compiled(
         stage1,
         routed_x.data_ptr(),
@@ -401,11 +523,34 @@ def kimi_k3_fhmoe_a16w4_from_sorted(
         stream,
     )
 
-    stage2_grid = (
-        routed_max_blocks * (KIMI_K3_ROUTED_HIDDEN // _STAGE2_TILE_N)
-        + KIMI_K3_SHARED_HIDDEN // _STAGE2_TILE_N
+    stage2_routed_grid = routed_max_blocks * (
+        KIMI_K3_ROUTED_HIDDEN // int(profile["s2_tn"])
     )
-    stage2 = compile_kimi_k3_fhmoe_stage2(NE=NE, use_k16=use_k16)
+    stage2_shared_grid = KIMI_K3_SHARED_HIDDEN // int(
+        profile.get("s2_stn", profile["s2_tn"])
+    )
+    stage2_grid = (
+        max(min(stage2_routed_grid, _GFX950_CU_COUNT), stage2_shared_grid)
+        if profile["s2_persist"]
+        else stage2_routed_grid + stage2_shared_grid
+    )
+    stage2 = compile_kimi_k3_fhmoe_stage2(
+        NE=NE,
+        BM=compute_bm,
+        SORT_BM=KIMI_K3_SORT_BLOCK_M,
+        TILE_N=int(profile["s2_tn"]),
+        TILE_K=int(profile["s2_tk"]),
+        routed_b_cache_mod=int(profile.get("s2_rbcm", profile["s2_bcm"])),
+        shared_b_cache_mod=int(profile.get("s2_sbcm", profile["s2_bcm"])),
+        use_k16=use_k16,
+        shared_weight_layout=shared_weight_layout,
+        routed_xcd_swizzle=int(profile["s2_xcd"]),
+        routed_persist=bool(profile["s2_persist"]),
+        shared_tile_n=int(profile.get("s2_stn", profile["s2_tn"])),
+        shared_tile_k=int(profile.get("s2_stk", profile["s2_tk"])),
+        shared_rowmajor_b_to_lds=bool(profile.get("s2_sblds", False)),
+        shared_first=bool(profile.get("s2_sfirst", False)),
+    )
     _run_compiled(
         stage2,
         workspace.routed_inter.data_ptr(),
@@ -443,6 +588,7 @@ def kimi_k3_fhmoe_a16w4(
     situ_beta: float = 4.0,
     situ_linear_beta: float = 25.0,
     swiglu_limit: float = float("inf"),
+    shared_weight_layout: str = "preshuffled",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Convenience API: sort routes, then execute the complete two-stage FHMoE."""
     M = routed_x.shape[0]
@@ -540,6 +686,7 @@ def kimi_k3_fhmoe_a16w4(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         swiglu_limit=swiglu_limit,
+        shared_weight_layout=shared_weight_layout,
     )
 
 

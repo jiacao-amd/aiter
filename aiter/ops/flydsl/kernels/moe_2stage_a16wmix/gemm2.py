@@ -144,6 +144,7 @@ def _gemm2_body_a16w4(
     i32_M,
     *,
     BM,
+    SORT_BM,
     TILE_N,
     TILE_K,
     N_OUT,
@@ -177,7 +178,9 @@ def _gemm2_body_a16w4(
     m_block_idx = bx_i32 // fx.Int32(_num_n_blocks)
     n_block_idx = bx_i32 % fx.Int32(_num_n_blocks)
     e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block_idx)))
-    m_row = m_block_idx * fx.Int32(BM)  # first sorted row of this m-block
+    # Keep the sorted-workspace stride independent from the compute tile height.
+    # Kimi decode can compute 16 rows while each expert still occupies 32 rows.
+    m_row = m_block_idx * fx.Int32(SORT_BM)
     by_n = n_block_idx * fx.Int32(TILE_N)
 
     # ---- B (weight) operand path: layouts + buffer resources + load closures ----
@@ -430,6 +433,7 @@ def compile_gemm2_a16w4_port(
                 wave,
                 i32_M,
                 BM=BM,
+                SORT_BM=BM,
                 TILE_N=TILE_N,
                 TILE_K=TILE_K,
                 N_OUT=N_OUT,

@@ -12,6 +12,9 @@ from aiter.fused_moe import moe_sorting
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kimi_k3_fhmoe import (
     KIMI_K3_BLOCK_M,
+    KIMI_K3_SORT_BLOCK_M,
+    _decode_compute_block_m,
+    _routed_grid_block_upper_bound,
     create_kimi_k3_fhmoe_workspace,
     kimi_k3_fhmoe_a16w4,
     kimi_k3_fhmoe_a16w4_from_sorted,
@@ -36,6 +39,40 @@ _SKIP = pytest.mark.skipif(
     get_gfx() != "gfx950" or not is_flydsl_available(),
     reason="Kimi-K3 FHMoE requires gfx950 and FlyDSL",
 )
+
+
+@pytest.mark.parametrize(
+    ("tokens", "num_experts", "capacity_blocks", "expected"),
+    [
+        (1, 896, 912, 16),
+        (4, 896, 912, 64),
+        (32, 896, 912, 512),
+        (32, 16, 16, 16),
+    ],
+)
+def test_kimi_k3_fhmoe_bounds_grid_to_active_routes(
+    tokens: int,
+    num_experts: int,
+    capacity_blocks: int,
+    expected: int,
+):
+    assert (
+        _routed_grid_block_upper_bound(tokens, num_experts, capacity_blocks)
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("tokens", "expected"),
+    [(1, 16), (8, 16), (16, 16), (17, 32), (32, 32)],
+)
+def test_kimi_k3_fhmoe_compute_bm_preserves_sort_stride(
+    tokens: int,
+    expected: int,
+):
+    assert KIMI_K3_SORT_BLOCK_M == 32
+    assert KIMI_K3_BLOCK_M == KIMI_K3_SORT_BLOCK_M
+    assert _decode_compute_block_m(tokens) == expected
 
 
 def _cos_diff(x: torch.Tensor, y: torch.Tensor) -> float:
@@ -121,9 +158,9 @@ def _make_graph_case(M: int, E: int) -> dict[str, torch.Tensor]:
 
 
 @_SKIP
-@pytest.mark.parametrize("M", [1, 2, 4, 8, 16, 32])
+@pytest.mark.parametrize("M", [1, 2, 4, 8, 16, 17, 32])
 def test_kimi_k3_fhmoe_matches_separate_kernels(M: int):
-    """The unified launches match routed FlyDSL plus a dense shared BF16 oracle."""
+    """Check BM16's M16 max collision and BM32 fallback at M17/M32."""
     E = KIMI_K3_TOPK
     torch.manual_seed(7 + M)
     torch.cuda.manual_seed(7 + M)
@@ -202,7 +239,7 @@ def test_kimi_k3_fhmoe_matches_separate_kernels(M: int):
         E,
         KIMI_K3_ROUTED_HIDDEN,
         torch.bfloat16,
-        32,
+        KIMI_K3_SORT_BLOCK_M,
         accumulate=True,
     )
 
@@ -224,7 +261,7 @@ def test_kimi_k3_fhmoe_matches_separate_kernels(M: int):
         D_HIDDEN=KIMI_K3_ROUTED_HIDDEN,
         D_INTER=KIMI_K3_ROUTED_INTER,
         topk=KIMI_K3_TOPK,
-        tile_m=32,
+        tile_m=KIMI_K3_SORT_BLOCK_M,
         tile_n=128,
         tile_k=256,
         act="situv2",
@@ -249,7 +286,7 @@ def test_kimi_k3_fhmoe_matches_separate_kernels(M: int):
         D_HIDDEN=KIMI_K3_ROUTED_HIDDEN,
         D_INTER=KIMI_K3_ROUTED_INTER,
         topk=KIMI_K3_TOPK,
-        tile_m=32,
+        tile_m=KIMI_K3_SORT_BLOCK_M,
         tile_n=128,
         tile_k=128,
     )
