@@ -40,6 +40,9 @@ KIMI_K3_SORT_BLOCK_M = 32
 # Backward-compatible public name: sorting/workspace rows remain fixed at 32.
 KIMI_K3_BLOCK_M = KIMI_K3_SORT_BLOCK_M
 KIMI_K3_MAX_DECODE_TOKENS = KIMI_K3_SORT_BLOCK_M
+# vLLM captures these decode batch sizes independently. Keep the list here so
+# AITER's graph regression coverage stays aligned with the serving contract.
+KIMI_K3_CUDAGRAPH_BATCH_SIZES = (1, 2, 4, 8, 16, 32)
 _KIMI_K3_ROUTED_EXPERTS = 896
 _STAGE1_TILE_N = 128
 _STAGE2_TILE_N = 128
@@ -55,6 +58,10 @@ _INTEGRATED_STAGE1_IDENTITY_M_INDICES_ENV = (
 )
 _INTEGRATED_STAGE1_A_LDS_SWIZZLE_ENV = "AITER_KIMI_K3_SHARED_A_LDS_SWIZZLE"
 _INTEGRATED_STAGE1_VEC2_PARTIALS_ENV = "AITER_KIMI_K3_SHARED_VEC2_PARTIALS"
+_SHARED_PIPELINE_WAIT_ENV = "AITER_KIMI_K3_SHARED_PIPELINE_WAIT"
+_INTEGRATED_ONLY_SHARED_PIPELINE_WAITS = frozenset(
+    {"defer3", "deferup3", "ring4"}
+)
 _SHARED_STAGE1_B_CACHE_MOD_ENV = "AITER_KIMI_K3_SHARED_B_CACHE_MOD"
 _ROUTED_STAGE1_B_CACHE_MOD_ENV = "AITER_KIMI_K3_ROUTED_STAGE1_B_CACHE_MOD"
 _UNIFIED_STAGE1_XCD_SWIZZLE_ENV = "AITER_KIMI_K3_UNIFIED_STAGE1_XCD_SWIZZLE"
@@ -294,6 +301,22 @@ def _integrated_stage1_vec2_partials() -> bool:
         f"{_INTEGRATED_STAGE1_VEC2_PARTIALS_ENV} must be a boolean, "
         f"got {value!r}"
     )
+
+
+def _shared_pipeline_wait(
+    *,
+    shared_weight_layout: str,
+    integrated_wait_profile: bool,
+) -> str:
+    """Resolve the shared Stage1 wait schedule for the selected M profile."""
+    if shared_weight_layout != "rowmajor":
+        return "default"
+    value = os.environ.get(_SHARED_PIPELINE_WAIT_ENV, "default")
+    if value in _INTEGRATED_ONLY_SHARED_PIPELINE_WAITS and not integrated_wait_profile:
+        # One process captures every decode bucket. M=16/32 use the generic
+        # shared path, where the split-K7-only schedules are not legal.
+        return "default"
+    return value
 
 
 def _shared_stage1_b_cache_mod(default: int) -> int:
@@ -997,6 +1020,20 @@ def kimi_k3_fhmoe_a16w4_from_sorted(
     )
     if stage1_block_waves == 8:
         integrated_stage1_tile_n = 64
+    integrated_wait_profile = (
+        use_integrated_stage1_splitk
+        and integrated_stage1_split_k == 7
+        and integrated_stage1_tile_n == 32
+        and stage1_block_waves == 4
+    )
+    shared_pipeline_wait = _shared_pipeline_wait(
+        shared_weight_layout=shared_weight_layout,
+        integrated_wait_profile=integrated_wait_profile,
+    )
+    # These experimental routed schedules were built around one BM16 MFMA row.
+    # A process may capture M=32 alongside smaller buckets, so ignore the
+    # BM16-only switches for the BM32 kernel instead of rejecting that capture.
+    use_routed_bm16_tuning = compute_bm == 16
     use_unified_scaled_stage1 = use_scaled_routed_stage1 and (
         os.environ.get("AITER_KIMI_K3_UNIFIED_SCALED_STAGE1", "0") == "1"
         or use_integrated_stage1_splitk
@@ -1238,13 +1275,7 @@ def kimi_k3_fhmoe_a16w4_from_sorted(
                 )
                 == "1"
             ),
-            kimi_shared_pipeline_wait=(
-                os.environ.get(
-                    "AITER_KIMI_K3_SHARED_PIPELINE_WAIT", "default"
-                )
-                if shared_weight_layout == "rowmajor"
-                else "default"
-            ),
+            kimi_shared_pipeline_wait=shared_pipeline_wait,
             # Only the A-load schedules depend on the BF16 source conversion.
             # B-pipeline, priority, and shared-workgroup schedules remain valid
             # when Opus supplies the routed input as native FP8.
@@ -1252,24 +1283,30 @@ def kimi_k3_fhmoe_a16w4_from_sorted(
                 os.environ.get("AITER_KIMI_K3_SHARED_START_SLEEP", "0")
             ),
             kimi_routed_late_a1=(
-                not use_fused_routed_a_fp8
+                use_routed_bm16_tuning
+                and not use_fused_routed_a_fp8
                 and os.environ.get("AITER_KIMI_K3_ROUTED_LATE_A1", "0") == "1"
             ),
             kimi_routed_a_ring2=(
-                not use_fused_routed_a_fp8
+                use_routed_bm16_tuning
+                and not use_fused_routed_a_fp8
                 and os.environ.get("AITER_KIMI_K3_ROUTED_A_RING2", "0") == "1"
             ),
             kimi_routed_b_ring4=(
-                os.environ.get("AITER_KIMI_K3_ROUTED_B_RING4", "0") == "1"
+                use_routed_bm16_tuning
+                and os.environ.get("AITER_KIMI_K3_ROUTED_B_RING4", "0") == "1"
             ),
             kimi_routed_b_early4=(
-                os.environ.get("AITER_KIMI_K3_ROUTED_B_EARLY4", "0") == "1"
+                use_routed_bm16_tuning
+                and os.environ.get("AITER_KIMI_K3_ROUTED_B_EARLY4", "0") == "1"
             ),
             kimi_routed_b_half_carry=(
-                os.environ.get("AITER_KIMI_K3_ROUTED_B_HALF_CARRY", "0") == "1"
+                use_routed_bm16_tuning
+                and os.environ.get("AITER_KIMI_K3_ROUTED_B_HALF_CARRY", "0") == "1"
             ),
             kimi_routed_priority3=(
-                os.environ.get("AITER_KIMI_K3_ROUTED_PRIORITY3", "0") == "1"
+                use_routed_bm16_tuning
+                and os.environ.get("AITER_KIMI_K3_ROUTED_PRIORITY3", "0") == "1"
             ),
             kimi_shared_wg_schedule=os.environ.get(
                 "AITER_KIMI_K3_SHARED_WG_SCHEDULE",

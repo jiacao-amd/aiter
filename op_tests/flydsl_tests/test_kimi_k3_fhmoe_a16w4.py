@@ -12,9 +12,12 @@ from aiter.fused_moe import moe_sorting
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kimi_k3_fhmoe import (
     KIMI_K3_BLOCK_M,
+    KIMI_K3_CUDAGRAPH_BATCH_SIZES,
     KIMI_K3_SORT_BLOCK_M,
     _decode_compute_block_m,
+    _decode_kernel_profile,
     _routed_grid_block_upper_bound,
+    _shared_pipeline_wait,
     create_kimi_k3_fhmoe_workspace,
     kimi_k3_fhmoe_a16w4,
     kimi_k3_fhmoe_a16w4_from_sorted,
@@ -45,9 +48,13 @@ _SKIP = pytest.mark.skipif(
     ("tokens", "num_experts", "capacity_blocks", "expected"),
     [
         (1, 896, 912, 16),
+        (2, 896, 912, 32),
         (4, 896, 912, 64),
+        (8, 896, 912, 128),
+        (16, 896, 912, 256),
         (32, 896, 912, 512),
-        (32, 16, 16, 16),
+        (32, 16, 912, 16),
+        (32, 896, 7, 7),
     ],
 )
 def test_kimi_k3_fhmoe_bounds_grid_to_active_routes(
@@ -64,7 +71,15 @@ def test_kimi_k3_fhmoe_bounds_grid_to_active_routes(
 
 @pytest.mark.parametrize(
     ("tokens", "expected"),
-    [(1, 16), (8, 16), (16, 16), (17, 32), (32, 32)],
+    [
+        (1, 16),
+        (2, 16),
+        (4, 16),
+        (8, 16),
+        (16, 16),
+        (17, 32),
+        (32, 32),
+    ],
 )
 def test_kimi_k3_fhmoe_compute_bm_preserves_sort_stride(
     tokens: int,
@@ -73,6 +88,74 @@ def test_kimi_k3_fhmoe_compute_bm_preserves_sort_stride(
     assert KIMI_K3_SORT_BLOCK_M == 32
     assert KIMI_K3_BLOCK_M == KIMI_K3_SORT_BLOCK_M
     assert _decode_compute_block_m(tokens) == expected
+
+
+@pytest.mark.parametrize("tokens", [0, 33])
+def test_kimi_k3_fhmoe_compute_bm_rejects_unsupported_tokens(tokens: int):
+    with pytest.raises(ValueError, match=r"tokens must be in \[1, 32\]"):
+        _decode_compute_block_m(tokens)
+
+
+@pytest.mark.parametrize("tokens", KIMI_K3_CUDAGRAPH_BATCH_SIZES)
+def test_kimi_k3_fhmoe_decode_profile_is_kernel_compatible(tokens: int):
+    profile = _decode_kernel_profile(tokens)
+    required = {
+        "s1_tn",
+        "s1_tk",
+        "s1_wpe",
+        "s1_xcd",
+        "s1_kw",
+        "s2_tn",
+        "s2_tk",
+        "s2_bcm",
+        "s2_xcd",
+        "s2_persist",
+    }
+    assert required <= profile.keys()
+
+    s1_tn = int(profile["s1_tn"])
+    s1_tk = int(profile["s1_tk"])
+    s1_stn = int(profile.get("s1_stn", s1_tn))
+    s1_stk = int(profile.get("s1_stk", s1_tk))
+    s2_tn = int(profile["s2_tn"])
+    s2_tk = int(profile["s2_tk"])
+    s2_stn = int(profile.get("s2_stn", s2_tn))
+    s2_stk = int(profile.get("s2_stk", s2_tk))
+
+    assert KIMI_K3_ROUTED_INTER % s1_tn == 0
+    assert KIMI_K3_ROUTED_HIDDEN % s1_tk == 0
+    assert KIMI_K3_SHARED_INTER % s1_stn == 0
+    assert KIMI_K3_SHARED_HIDDEN % s1_stk == 0
+    assert KIMI_K3_ROUTED_HIDDEN % s2_tn == 0
+    assert KIMI_K3_ROUTED_INTER % s2_tk == 0
+    assert KIMI_K3_SHARED_HIDDEN % s2_stn == 0
+    assert KIMI_K3_SHARED_INTER % s2_stk == 0
+
+    for key in ("s1_rbcm", "s1_sbcm", "s2_bcm", "s2_rbcm", "s2_sbcm"):
+        if key in profile:
+            assert int(profile[key]) in range(4)
+
+
+@pytest.mark.parametrize("wait", ["defer3", "deferup3", "ring4"])
+def test_kimi_k3_fhmoe_integrated_wait_falls_back_for_large_m(
+    monkeypatch: pytest.MonkeyPatch,
+    wait: str,
+):
+    monkeypatch.setenv("AITER_KIMI_K3_SHARED_PIPELINE_WAIT", wait)
+    assert (
+        _shared_pipeline_wait(
+            shared_weight_layout="rowmajor",
+            integrated_wait_profile=True,
+        )
+        == wait
+    )
+    assert (
+        _shared_pipeline_wait(
+            shared_weight_layout="rowmajor",
+            integrated_wait_profile=False,
+        )
+        == "default"
+    )
 
 
 def _cos_diff(x: torch.Tensor, y: torch.Tensor) -> float:
@@ -158,7 +241,7 @@ def _make_graph_case(M: int, E: int) -> dict[str, torch.Tensor]:
 
 
 @_SKIP
-@pytest.mark.parametrize("M", [1, 2, 4, 8, 16, 17, 32])
+@pytest.mark.parametrize("M", [*KIMI_K3_CUDAGRAPH_BATCH_SIZES, 17])
 def test_kimi_k3_fhmoe_matches_separate_kernels(M: int):
     """Check BM16's M16 max collision and BM32 fallback at M17/M32."""
     E = KIMI_K3_TOPK
@@ -334,15 +417,18 @@ def test_kimi_k3_fhmoe_matches_separate_kernels(M: int):
 
 
 @_SKIP
-def test_kimi_k3_fhmoe_reusable_workspace_graph_replay():
-    """The complete sorting + compute operator is safe to capture and replay."""
-    M = 4
+@pytest.mark.parametrize("M", KIMI_K3_CUDAGRAPH_BATCH_SIZES)
+def test_kimi_k3_fhmoe_reusable_workspace_graph_replay(M: int):
+    """Every serving decode bucket is safe to capture and replay."""
     E = KIMI_K3_TOPK
     case = _make_graph_case(M, E)
-    max_sorted_tokens = M * KIMI_K3_TOPK + E * KIMI_K3_BLOCK_M - KIMI_K3_TOPK
+    max_batch = max(KIMI_K3_CUDAGRAPH_BATCH_SIZES)
+    max_sorted_tokens = (
+        max_batch * KIMI_K3_TOPK + E * KIMI_K3_BLOCK_M - KIMI_K3_TOPK
+    )
     workspace = create_kimi_k3_fhmoe_workspace(
         max_sorted_tokens=max_sorted_tokens,
-        max_tokens=M,
+        max_tokens=max_batch,
         num_experts=E,
         device=case["routed_x"].device,
     )
