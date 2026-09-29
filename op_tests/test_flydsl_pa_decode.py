@@ -18,6 +18,7 @@ import importlib
 import itertools
 from dataclasses import dataclass, replace
 from functools import partial
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -82,6 +83,7 @@ class DecodeCase:
     num_kv_heads: int = 1
     query_group_size: int = 16
     head_dim: int = 128
+    value_head_dim: int | None = None
     block_size: int = 128
     trans_v: bool = True
     dtype: torch.dtype = torch.bfloat16
@@ -132,11 +134,20 @@ def run_torch(
 ):
     """Dequantized FP32 GQA reference, including empty rows and infinite sinks."""
     batch = context_lengths.numel()
-    heads, dim = query.shape[1:]
+    heads, qk_dim = query.shape[1:]
+    value_dim = value_cache.shape[2]
     kv_heads, page_size = key_cache.shape[1:3]
     group = heads // kv_heads
-    queries = query.float().reshape(batch, query_length, kv_heads, group, dim)
-    output = torch.zeros_like(queries)
+    queries = query.float().reshape(batch, query_length, kv_heads, group, qk_dim)
+    output = torch.zeros(
+        batch,
+        query_length,
+        kv_heads,
+        group,
+        value_dim,
+        dtype=torch.float32,
+        device=query.device,
+    )
     positions = torch.arange(query_length, device=query.device)
 
     for seq, length in enumerate(context_lengths.cpu().tolist()):
@@ -153,7 +164,7 @@ def run_torch(
         else:
             keys *= key_scale[pages, :, offsets, 0, None]
             values *= value_scale[pages, :, offsets, 0, None]
-        scores = torch.einsum("qhgd,khd->qhgk", queries[seq], keys) * dim**-0.5
+        scores = torch.einsum("qhgd,khd->qhgk", queries[seq], keys) * qk_dim**-0.5
         visible = length - query_length + 1 + positions
         masked = tokens[None, :] >= visible[:, None]
         if sliding_window > 0:
@@ -168,12 +179,13 @@ def run_torch(
         probs = torch.exp(scores - log_denominator)
         probs.masked_fill_(visible[:, None, None, None] <= 0, 0)
         output[seq] = torch.einsum("qhgk,khd->qhgd", probs, values)
-    return output.reshape_as(query)
+    return output.reshape(batch * query_length, heads, value_dim).to(query.dtype)
 
 
 def _make_inputs(case, planned=False):
     torch.manual_seed(37 if case.sparse else 0)
-    batch, page, dim = len(case.lengths), case.block_size, case.head_dim
+    batch, page, qk_dim = len(case.lengths), case.block_size, case.head_dim
+    value_dim = qk_dim if case.value_head_dim is None else case.value_head_dim
     kv_heads, ql = case.num_kv_heads, case.query_length
     heads = kv_heads * case.query_group_size
     counts = [max(1, (length + page - 1) // page) for length in case.lengths]
@@ -181,13 +193,17 @@ def _make_inputs(case, planned=False):
     quant_dtype = (
         torch.float8_e4m3fn if get_gfx_runtime() == "gfx950" else torch.float8_e4m3fnuz
     )
-    query = torch.empty((batch * ql, heads, dim), dtype=case.dtype).uniform_(-0.5, 0.5)
-    if case.masked_scale:
-        query.zero_()  # Exercise zero-scale Q quantization.
-    key = torch.empty((num_pages, kv_heads, page, dim), dtype=case.dtype).uniform_(
+    query = torch.empty((batch * ql, heads, qk_dim), dtype=case.dtype).uniform_(
         -0.5, 0.5
     )
-    value = torch.empty_like(key).uniform_(-0.5, 0.5)
+    if case.masked_scale:
+        query.zero_()  # Exercise zero-scale Q quantization.
+    key = torch.empty((num_pages, kv_heads, page, qk_dim), dtype=case.dtype).uniform_(
+        -0.5, 0.5
+    )
+    value = torch.empty(
+        (num_pages, kv_heads, page, value_dim), dtype=case.dtype
+    ).uniform_(-0.5, 0.5)
     quantize = pertoken_quant if case.per_token else per_tensor_quant
     key_quant, key_scale = quantize(key, quant_dtype=quant_dtype)
     value_quant, value_scale = quantize(value, quant_dtype=quant_dtype)
@@ -247,12 +263,12 @@ def _make_inputs(case, planned=False):
     if case.per_token:
         key_scale, value_scale = scatter(key_scale), scatter(value_scale)
     key_cache = (
-        key_quant.reshape(physical_pages, kv_heads, page, dim // 16, 16)
+        key_quant.reshape(physical_pages, kv_heads, page, qk_dim // 16, 16)
         .permute(0, 1, 3, 2, 4)
         .contiguous()
     )
     value_cache = (
-        value_quant.reshape(physical_pages, kv_heads, page // 16, 16, dim)
+        value_quant.reshape(physical_pages, kv_heads, page // 16, 16, value_dim)
         .permute(0, 1, 2, 4, 3)
         .contiguous()
         if case.trans_v
@@ -306,15 +322,19 @@ def _make_inputs(case, planned=False):
     )
     psum = torch.full(shape, float("nan"), dtype=torch.float32)
     pmax = torch.full_like(psum, float("nan"))
-    pout = torch.full((*shape, dim), float("nan"), dtype=case.dtype)
+    pout = torch.full((*shape, value_dim), float("nan"), dtype=case.dtype)
     args = (
-        torch.full_like(query, float("nan")),
+        torch.full(
+            (batch * ql, heads, value_dim),
+            float("nan"),
+            dtype=case.dtype,
+        ),
         query,
         key_cache,
         value_cache,
         context,
         table,
-        dim**-0.5,
+        qk_dim**-0.5,
         ql,
         parts,
         KV_COMPUTE_BLOCK,
@@ -494,7 +514,8 @@ def _case(
     sink=None,
     **kwargs,
 ):
-    # shape = (QL, KV heads, GQA, D); cache = (page size, transposed V, per-token).
+    # shape = (QL, KV heads, GQA, QK dim); value_head_dim defaults to QK dim.
+    # cache = (page size, transposed V, per-token).
     ql, heads, group, dim = shape
     page, trans_v, per_token = cache
     return pytest.param(
@@ -531,6 +552,25 @@ LENS_1024 = (0, 1, 1025, 1281)
 LENS_4096 = (0, 1, 4097, 4353)
 LENS_8192 = (0, 1, 8193, 8449)
 CASES = [
+    _case(
+        "mimo-diffkv-swa128",
+        (1, 2, 16, 192),
+        (16, 1, 1),
+        parts=1,
+        window=128,
+        lengths=(1, 127, 128, 129, 257),
+        value_head_dim=128,
+        query_splits=1,
+    ),
+    _case(
+        "mimo-diffkv-full",
+        (1, 2, 16, 192),
+        (16, 1, 1),
+        parts=8,
+        lengths=(257, 8193),
+        value_head_dim=128,
+        query_splits=1,
+    ),
     *_cases(
         "shape cache parts window sink",
         [
@@ -886,7 +926,12 @@ def test_pa_decode(case, planned, monkeypatch):
                 )
             return
     args, options, reference = _make_inputs(case, planned)
-    if not planned and case.sliding_window > 0:
+    direct_swa128 = (
+        case.sliding_window == 128
+        and case.query_length == 1
+        and case.num_partitions == 1
+    )
+    if not planned and case.sliding_window > 0 and not direct_swa128:
         with pytest.raises(ValueError, match="work_plan"):
             pa_decode(*args, **options)
         with pytest.raises(ValueError, match="work_plan"):
@@ -988,12 +1033,135 @@ def test_pa_decode(case, planned, monkeypatch):
         _assert_plan(extreme_plan, lengths)
 
 
+@pytest.mark.parametrize(
+    ("batch_size", "context_length", "expected_splits"),
+    [
+        (1, 150_000, 256),
+        (4, 64_000, 64),
+        (8, 32_000, 32),
+        (16, 32_000, 16),
+        (32, 8_192, 8),
+        (32, 32_000, 8),
+    ],
+)
+def test_mimo_recommended_splits_target_two_workgroups_per_cu(
+    monkeypatch, batch_size, context_length, expected_splits
+):
+    """Keep MiMo page-16 decode near two workgroups per gfx950 CU."""
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=256),
+    )
+
+    assert (
+        get_recommended_splits(
+            batch_size,
+            num_kv_heads=2,
+            split_kv_blocks=KV_COMPUTE_BLOCK // 16,
+            max_partitions=MAX_CONTEXT_PARTITIONS,
+            max_context_length=context_length,
+        )
+        == expected_splits
+    )
+
+
+def test_mimo_direct_swa128_does_not_read_masked_kv():
+    """Poison KV outside the window; exact SWA128 must remain finite and correct."""
+    case = DecodeCase(
+        lengths=(127, 128, 129, 257),
+        query_length=1,
+        num_kv_heads=2,
+        query_group_size=16,
+        head_dim=192,
+        value_head_dim=128,
+        block_size=16,
+        trans_v=True,
+        num_partitions=1,
+        per_token=True,
+        sliding_window=128,
+        sparse=True,
+        query_splits=1,
+    )
+    args, options, reference_call = _make_inputs(case, planned=False)
+    reference = reference_call()
+    key_cache, value_cache = args[2], args[3]
+    context, block_tables = args[4], args[5]
+    key_scale, value_scale = args[12], args[13]
+
+    for seq, length in enumerate(context.cpu().tolist()):
+        window_start = max(0, length - case.sliding_window)
+        allocated = (length + case.block_size - 1) // case.block_size
+        for token in range(allocated * case.block_size):
+            if window_start <= token < length:
+                continue
+            phys = int(block_tables[seq, token // case.block_size].item())
+            offset = token % case.block_size
+            key_cache[phys, :, :, offset, :].fill_(float("nan"))
+            value_cache[phys, :, 0, :, offset].fill_(float("nan"))
+            key_scale[phys, :, offset].fill_(float("nan"))
+            value_scale[phys, :, offset].fill_(float("nan"))
+
+    output = _run_flydsl(*args, **options)
+    assert torch.isfinite(output).all()
+    _assert_close(output, reference)
+
+
+@pytest.mark.parametrize(("sliding_window", "parts"), [(128, 1), (0, 8)])
+def test_mimo_diffkv_supports_padded_block_strides(sliding_window, parts):
+    """Honor vLLM-style padding between otherwise native shuffle pages."""
+    case = DecodeCase(
+        lengths=(257, 8193),
+        query_length=1,
+        num_kv_heads=2,
+        query_group_size=16,
+        head_dim=192,
+        value_head_dim=128,
+        block_size=16,
+        trans_v=True,
+        num_partitions=parts,
+        per_token=False,
+        sliding_window=sliding_window,
+        sparse=True,
+        query_splits=1,
+    )
+    args, options, reference_call = _make_inputs(case, planned=False)
+    reference = reference_call()
+    key_cache, value_cache = args[2], args[3]
+
+    def pad_blocks(cache, padding):
+        block_stride = cache[0].numel() + padding
+        storage = torch.full(
+            ((cache.shape[0] - 1) * block_stride + cache[0].numel(),),
+            float("nan"),
+            dtype=cache.dtype,
+            device=cache.device,
+        )
+        padded = torch.as_strided(
+            storage,
+            size=cache.shape,
+            stride=(block_stride, *cache.stride()[1:]),
+        )
+        padded.copy_(cache)
+        return padded
+
+    padded_args = (
+        *args[:2],
+        pad_blocks(key_cache, 64),
+        pad_blocks(value_cache, 128),
+        *args[4:],
+    )
+    output = _run_flydsl(*padded_args, **options)
+    _assert_close(output, reference)
+
+
 @benchmark()
 def run_pa_decode_tile_case(
     batch_size,
     num_query_heads,
     num_kv_heads,
-    head_dim,
+    qk_head_dim,
+    value_head_dim,
     context_length,
     block_size,
     dtype,
@@ -1002,6 +1170,7 @@ def run_pa_decode_tile_case(
     per_token=False,
     query_length=1,
     num_partitions=None,
+    sliding_window=0,
 ):
     if min(batch_size, context_length, query_length, num_query_heads, num_kv_heads) < 1:
         raise ValueError(
@@ -1018,13 +1187,15 @@ def run_pa_decode_tile_case(
         query_length=query_length,
         num_kv_heads=num_kv_heads,
         query_group_size=num_query_heads // num_kv_heads,
-        head_dim=head_dim,
+        head_dim=qk_head_dim,
+        value_head_dim=value_head_dim,
         block_size=block_size,
         dtype=dtype,
         trans_v=trans_v,
         num_partitions=num_partitions,
         max_partitions=max_partitions,
         per_token=per_token,
+        sliding_window=sliding_window,
         sparse=False,
     )
     args, options, reference_call = _make_inputs(case)
@@ -1035,17 +1206,25 @@ def run_pa_decode_tile_case(
     _assert_close(output, reference)
     query, table = args[1], args[5]
     attended = sum(
-        max(0, context_length - query_length + 1 + p) for p in range(query_length)
+        min(
+            max(0, context_length - query_length + 1 + p),
+            sliding_window if sliding_window > 0 else context_length,
+        )
+        for p in range(query_length)
     )
-    flops = 4 * batch_size * num_query_heads * attended * head_dim
-    scale_elements = batch_size * num_kv_heads * context_length if per_token else 1
+    flops = 2 * batch_size * num_query_heads * attended * (qk_head_dim + value_head_dim)
+    attended_kv = min(
+        context_length,
+        sliding_window if sliding_window > 0 else context_length,
+    )
+    scale_elements = batch_size * num_kv_heads * attended_kv if per_token else 1
     nbytes = (
-        2 * query.numel() * query.element_size()
-        + 2
-        * batch_size
+        query.numel() * query.element_size()
+        + args[0].numel() * args[0].element_size()
+        + batch_size
         * num_kv_heads
-        * context_length
-        * head_dim
+        * attended_kv
+        * (qk_head_dim + value_head_dim)
         * args[2].element_size()
         + table.numel() * table.element_size()
         + args[4].numel() * args[4].element_size()
@@ -1095,7 +1274,10 @@ def _parse_args(argv=None):
         type=dtypes.str2tuple,
         nargs="*",
         default=DEFAULT_SHAPES,
-        help="num_query_heads,num_kv_heads,head_dim,context_length",
+        help=(
+            "num_query_heads,num_kv_heads,qk_head_dim,context_length or "
+            "num_query_heads,num_kv_heads,qk_head_dim,value_head_dim,context_length"
+        ),
     )
     parser.add_argument(
         "--block-size",
@@ -1133,6 +1315,13 @@ def _parse_args(argv=None):
         default=[None],
         help="Exact split counts (1..256), overriding --max-partitions.",
     )
+    parser.add_argument(
+        "--sliding-window",
+        type=int,
+        nargs="+",
+        default=[0],
+        help="Sliding-window sizes; 0 disables sliding-window attention.",
+    )
     args = parser.parse_args(argv)
     if (
         args.max_partitions is not None
@@ -1141,9 +1330,17 @@ def _parse_args(argv=None):
         parser.error(f"--max-partitions must be in [4, {MAX_CONTEXT_PARTITIONS}]")
     if any(n is not None and n > MAX_CONTEXT_PARTITIONS for n in args.num_partitions):
         parser.error(f"--num-partitions must be in [1, {MAX_CONTEXT_PARTITIONS}]")
+    if any(window < 0 for window in args.sliding_window):
+        parser.error("--sliding-window values must be nonnegative")
     for shape in args.shapes:
-        if not isinstance(shape, tuple) or len(shape) != 4 or any(n < 1 for n in shape):
-            parser.error("each --shapes value must contain four positive integers")
+        if (
+            not isinstance(shape, tuple)
+            or len(shape) not in (4, 5)
+            or any(n < 1 for n in shape)
+        ):
+            parser.error(
+                "each --shapes value must contain four or five positive integers"
+            )
         if shape[0] % shape[1]:
             parser.error("num_query_heads must be divisible by num_kv_heads")
     return args
@@ -1160,7 +1357,17 @@ def main():
         return
     torch.set_default_device("cuda")
     rows = []
-    for dtype, batch, shape, page, trans_v, per_token, ql, parts in itertools.product(
+    for (
+        dtype,
+        batch,
+        shape,
+        page,
+        trans_v,
+        per_token,
+        ql,
+        parts,
+        sliding_window,
+    ) in itertools.product(
         args.dtype,
         args.batch,
         args.shapes,
@@ -1169,14 +1376,20 @@ def main():
         args.per_token,
         args.query_length,
         args.num_partitions,
+        args.sliding_window,
     ):
-        heads, kv_heads, dim, context = shape
+        if len(shape) == 4:
+            heads, kv_heads, qk_dim, context = shape
+            value_dim = qk_dim
+        else:
+            heads, kv_heads, qk_dim, value_dim, context = shape
         rows.append(
             run_pa_decode_tile_case(
                 batch,
                 heads,
                 kv_heads,
-                dim,
+                qk_dim,
+                value_dim,
                 context,
                 page,
                 dtype,
@@ -1185,6 +1398,7 @@ def main():
                 bool(per_token),
                 query_length=ql,
                 num_partitions=parts,
+                sliding_window=sliding_window,
             )
         )
     aiter.logger.info(

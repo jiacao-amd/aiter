@@ -186,10 +186,10 @@ def launch_pa_decode_ps_reduce(
 
 
 def pa_decode(
-    output: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
-    query: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
-    key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
-    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
+    output: torch.Tensor,  # [num_seqs * query_length, num_query_heads, value_head_dim]
+    query: torch.Tensor,  # [num_seqs * query_length, num_query_heads, qk_head_dim]
+    key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, qk_head_dim // x, kv_block_size, x]
+    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, value_head_dim, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, value_head_dim, x]
     context_lengths: torch.Tensor,  # [num_seqs]
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     softmax_scale: float,
@@ -202,7 +202,7 @@ def pa_decode(
     value_scale: torch.Tensor = None,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     exp_sums: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_length * query_group_size]
     max_logits: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_length * query_group_size]
-    temporary_output: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_length * query_group_size, head_size]
+    temporary_output: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_length * query_group_size, value_head_dim]
     alibi_slopes: torch.Tensor = None,
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
@@ -210,14 +210,17 @@ def pa_decode(
 ) -> None:
     """Decode FP8 K/V with BF16/FP16 queries using 256-token compute tiles.
 
-    Supports page sizes 16/64/128 and head_dim 64 or multiples of 128 up to 1024.
+    Supports page sizes 16/64/128. Q/K head dimensions are multiples of 64 in
+    [64, 1024], and V head dimensions are multiples of 64 in [64, 1024].
     K/V scales are [1] or [num_blocks, num_kv_heads, block_size, 1].
     ALiBi and externally quantized queries are unsupported.
 
     MTP lengths include the query tokens and use dense causal masking.
     Independently selected sparse queries need separate table rows and
-    query_length=1. Positive ``sliding_window`` requires ``work_plan`` and
-    includes each query's own position; 0 and -1 disable it.
+    query_length=1. MiMo QK192/V128 GQA16 page16 SWA128 decode can run directly
+    with one partition; other positive ``sliding_window`` configurations require
+    ``work_plan``. The window includes each query's own position; 0 and -1
+    disable it.
 
     ``sinks`` is a contiguous [num_query_heads] BF16/FP16/FP32 tensor on the
     query device: unscaled zero-value logits shared across batch/MTP positions.
@@ -250,12 +253,26 @@ def pa_decode(
     if sliding_window < -1:
         raise ValueError("sliding_window must be -1, 0, or positive")
     sliding_window = max(sliding_window, 0)
-    if sliding_window > 0 and work_plan is None:
-        raise ValueError("positive sliding_window requires work_plan")
     if not isinstance(query_length, int):
         raise TypeError("query_length must be an int")
     if query_length < 1:
         raise ValueError(f"query_length must be positive, got {query_length}")
+    direct_swa128 = (
+        sliding_window == 128
+        and query_length == 1
+        and max_context_partition_num == 1
+        and work_plan is None
+        and query.shape[-1] == 192
+        and output.shape[-1] == 128
+        and query.shape[1] // key_cache.shape[1] == 16
+        and key_cache.shape[3] == 16
+        and value_cache.dim() == 5
+    )
+    if sliding_window > 0 and work_plan is None and not direct_swa128:
+        raise ValueError(
+            "positive sliding_window requires work_plan, except direct "
+            "SWA128 decode with query_length=1 and max_context_partition_num=1"
+        )
     if (
         work_plan is None
         and not 1 <= max_context_partition_num <= MAX_CONTEXT_PARTITIONS
@@ -295,7 +312,8 @@ def pa_decode(
             )
 
     num_seqs = context_lengths.shape[0]
-    total_q_rows, num_q_heads, head_dim = query.shape
+    total_q_rows, num_q_heads, qk_head_dim = query.shape
+    output_rows, output_heads, value_head_dim = output.shape
     if query.device.type != "cuda":
         raise ValueError(f"query must be on a CUDA device, got {query.device}")
     if num_q_heads < 1:
@@ -305,10 +323,10 @@ def pa_decode(
             f"query.shape[0] ({total_q_rows}) must equal "
             f"context_lengths.shape[0] * query_length ({num_seqs} * {query_length})"
         )
-    if output.shape != query.shape:
+    if (output_rows, output_heads) != (total_q_rows, num_q_heads):
         raise ValueError(
-            f"output shape {tuple(output.shape)} must match "
-            f"query shape {tuple(query.shape)}"
+            "output's token and head dimensions must match query, "
+            f"got output={tuple(output.shape)} and query={tuple(query.shape)}"
         )
     if block_tables.shape[0] != num_seqs:
         raise ValueError(
@@ -324,21 +342,26 @@ def pa_decode(
 
     # Enforce tile Q-load constraints and the reducer's 1024-thread limit,
     # including for direct output.
-    q_chunk = head_dim // 16
+    q_chunk = qk_head_dim // 16
     if not (
-        64 <= head_dim <= 1024
-        and head_dim % 64 == 0
-        and (q_chunk <= 8 or q_chunk % 8 == 0)
+        64 <= qk_head_dim <= 1024
+        and qk_head_dim % 64 == 0
+        and (q_chunk <= 8 or q_chunk % 4 == 0)
     ):
         raise NotImplementedError(
-            f"pa_decode does not support head_dim={head_dim}; supported values "
-            "are 64 and multiples of 128 in [128, 1024]"
+            f"pa_decode does not support qk_head_dim={qk_head_dim}; supported "
+            "values are multiples of 64 in [64, 1024]"
         )
-    if num_hgroups != head_dim // 16 or hgroup_width != 16:
+    if not (64 <= value_head_dim <= 1024 and value_head_dim % 64 == 0):
+        raise NotImplementedError(
+            f"pa_decode does not support value_head_dim={value_head_dim}; "
+            "supported values are multiples of 64 in [64, 1024]"
+        )
+    if num_hgroups != qk_head_dim // 16 or hgroup_width != 16:
         raise ValueError(
             "key_cache shape must be "
-            "[num_blocks, num_kv_heads, head_dim // 16, block_size, 16], "
-            f"got {tuple(key_cache.shape)} for head_dim={head_dim}"
+            "[num_blocks, num_kv_heads, qk_head_dim // 16, block_size, 16], "
+            f"got {tuple(key_cache.shape)} for qk_head_dim={qk_head_dim}"
         )
     if block_size not in (16, 64, 128):
         raise ValueError(
@@ -348,22 +371,22 @@ def pa_decode(
     trans_v = value_cache.dim() == 5
     if trans_v:
         v_num_blocks, v_num_kv_heads = value_cache.shape[:2]
-        expected_v_tail = (block_size // 16, head_dim, 16)
+        expected_v_tail = (block_size // 16, value_head_dim, 16)
         if tuple(value_cache.shape[2:]) != expected_v_tail:
             raise ValueError(
                 "transposed value_cache shape must be "
-                "[num_blocks, num_kv_heads, block_size // 16, head_dim, 16], "
+                "[num_blocks, num_kv_heads, block_size // 16, value_head_dim, 16], "
                 f"got {tuple(value_cache.shape)} for block_size={block_size}, "
-                f"head_dim={head_dim}"
+                f"value_head_dim={value_head_dim}"
             )
     else:
         v_num_blocks, v_num_kv_heads, v_head_dim, v_block_size = value_cache.shape
-        if v_head_dim != head_dim or v_block_size != block_size:
+        if v_head_dim != value_head_dim or v_block_size != block_size:
             raise ValueError(
                 "value_cache shape must be "
-                "[num_blocks, num_kv_heads, head_dim, block_size], "
+                "[num_blocks, num_kv_heads, value_head_dim, block_size], "
                 f"got {tuple(value_cache.shape)} for block_size={block_size}, "
-                f"head_dim={head_dim}"
+                f"value_head_dim={value_head_dim}"
             )
     # Packed V is a shifted view and may span fewer blocks than K.
     if v_num_blocks > num_blocks:
@@ -462,13 +485,54 @@ def pa_decode(
                 f"got {tensor.device}"
             )
     for name, tensor in (
-        ("key_cache", key_cache),
-        ("value_cache", value_cache),
         ("block_tables", block_tables),
         ("context_lengths", context_lengths),
     ):
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
+
+    key_page_elements = num_kv_heads * qk_head_dim * block_size
+    expected_key_strides = (
+        qk_head_dim * block_size,
+        block_size * 16,
+        16,
+        1,
+    )
+    if key_cache.stride()[1:] != expected_key_strides:
+        raise ValueError(
+            "key_cache must be contiguous within each block in shuffled "
+            "[H, qk_head_dim // 16, block_size, 16] order; "
+            f"got strides {key_cache.stride()}"
+        )
+    if key_cache.stride(0) < key_page_elements:
+        raise ValueError(
+            "key_cache block stride must cover one complete K page, "
+            f"got {key_cache.stride(0)} < {key_page_elements}"
+        )
+
+    value_page_elements = num_kv_heads * value_head_dim * block_size
+    expected_value_strides = (
+        (
+            (block_size // 16) * value_head_dim * 16,
+            value_head_dim * 16,
+            16,
+            1,
+        )
+        if trans_v
+        else (value_head_dim * block_size, block_size, 1)
+    )
+    if value_cache.stride()[1:] != expected_value_strides:
+        raise ValueError(
+            "value_cache must be contiguous within each block in its declared "
+            f"layout; got strides {value_cache.stride()}"
+        )
+    if value_cache.stride(0) < value_page_elements:
+        raise ValueError(
+            "value_cache block stride must cover one complete V page, "
+            f"got {value_cache.stride(0)} < {value_page_elements}"
+        )
+    if key_cache.stride(0) > 2**31 - 1 or value_cache.stride(0) > 2**31 - 1:
+        raise ValueError("KV cache block strides must fit signed int32 elements")
 
     def normalize_scale(scale, name):
         if scale is None:
@@ -556,14 +620,17 @@ def pa_decode(
     psum = exp_sums
     pout = temporary_output
 
-    # Widen before either cache's i32 element offsets can wrap.
-    wide_kv_addressing = max(key_cache.numel(), value_cache.numel()) >= 2**31
+    # Widen before either cache's physical element offsets can wrap.
+    key_extent = (num_blocks - 1) * key_cache.stride(0) + key_page_elements
+    value_extent = (v_num_blocks - 1) * value_cache.stride(0) + value_page_elements
+    wide_kv_addressing = max(key_extent, value_extent) >= 2**31
 
     # Add sinks once: here for static NP=1, otherwise in reduction.
     use_direct_sinks = sinks is not None and num_partitions == 1 and work_plan is None
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(
-            head_dim=head_dim,
+            qk_head_dim=qk_head_dim,
+            value_head_dim=value_head_dim,
             query_group_size=query_group_size,
             block_size=int(block_size),
             num_seqs=num_seqs,
@@ -605,7 +672,10 @@ def pa_decode(
                 )
             if pout is None:
                 pout = torch.empty(
-                    *expected_scalar_shape, head_dim, dtype=output.dtype, device=dev
+                    *expected_scalar_shape,
+                    value_head_dim,
+                    dtype=output.dtype,
+                    device=dev,
                 )
         for name, tensor in (
             ("max_logits", pmax),
@@ -624,7 +694,7 @@ def pa_decode(
             raise ValueError(
                 f"exp_sums shape {tuple(psum.shape)} != {expected_scalar_shape}"
             )
-        expected_output_shape = (*expected_scalar_shape, head_dim)
+        expected_output_shape = (*expected_scalar_shape, value_head_dim)
         if pout.shape != expected_output_shape:
             raise ValueError(
                 f"temporary_output shape {tuple(pout.shape)} != {expected_output_shape}"
@@ -673,6 +743,8 @@ def pa_decode(
             int(max_blocks_per_seq),
             int(num_seqs),
             int(num_kv_heads),
+            int(key_cache.stride(0)),
+            int(value_cache.stride(0)),
             stride_ks_block,
             stride_ks_head,
             int(output.stride(0)),
@@ -689,7 +761,11 @@ def pa_decode(
         )
         if num_partitions > 1 or work_plan is not None:
             output_5d = output.reshape(
-                num_seqs, query_length, num_kv_heads, query_group_size, head_dim
+                num_seqs,
+                query_length,
+                num_kv_heads,
+                query_group_size,
+                value_head_dim,
             )
             launch_pa_decode_ps_reduce(
                 output_5d,
@@ -710,7 +786,7 @@ def pa_decode(
                 pout.stride(3) if work_plan is None else pout.stride(2),
                 query_seq_len=query_length,
                 query_group_size=query_group_size,
-                head_size=head_dim,
+                head_size=value_head_dim,
                 context_partition_num=num_partitions,
                 stream=s,
                 reduce_info=work_plan.reduce_info if work_plan is not None else None,

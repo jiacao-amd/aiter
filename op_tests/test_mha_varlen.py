@@ -1426,12 +1426,12 @@ def test_fmha_fwd_bf16_opus_d192_v128_group(
         if seqlens_kv[g] == 0:
             # Assert the contract exactly rather than through attention_ref, whose
             # degenerate-shape behaviour is its own question.
-            assert torch.equal(
-                out[ql:qh], torch.zeros_like(out[ql:qh])
-            ), f"group {g} has no keys, out must be exactly 0"
-            assert torch.isneginf(
-                lse[:, ql:qh]
-            ).all(), f"group {g} has no keys, lse must be -inf"
+            assert torch.equal(out[ql:qh], torch.zeros_like(out[ql:qh])), (
+                f"group {g} has no keys, out must be exactly 0"
+            )
+            assert torch.isneginf(lse[:, ql:qh]).all(), (
+                f"group {g} has no keys, lse must be -inf"
+            )
             continue
         qg = q[ql:qh].unsqueeze(0)
         kg = k[kl:kh].unsqueeze(0)
@@ -1448,3 +1448,45 @@ def test_fmha_fwd_bf16_opus_d192_v128_group(
             f"opus-d192-group g{g}", lse[:, ql:qh], opus_ref_lse(qg, kg, causal)[0]
         )
     print(f"[opus-d192-group] max diff across groups: {max_diff}")
+
+
+def test_mha_varlen_d192_v128_sink_matches_reference():
+    """D192/V128 must preserve MiMo's per-head attention sink."""
+    if get_gfx() not in ("gfx942", "gfx950"):
+        pytest.skip("D192/V128 v3 dispatch requires gfx942 or gfx950")
+
+    torch.manual_seed(0)
+    batch, seqlen, nheads, nheads_k = 1, 8, 32, 2
+    d_qk, d_v = 192, 128
+    q = torch.randn(batch, seqlen, nheads, d_qk, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(batch, seqlen, nheads_k, d_qk, device="cuda", dtype=dtypes.bf16)
+    v = torch.randn(batch, seqlen, nheads_k, d_v, device="cuda", dtype=dtypes.bf16)
+    sink = torch.linspace(-1.0, 1.0, nheads, device="cuda", dtype=dtypes.bf16)
+    cu_seqlens = torch.tensor([0, seqlen], device="cuda", dtype=torch.int32)
+    output = torch.empty(seqlen, nheads, d_v, device="cuda", dtype=dtypes.bf16)
+
+    aiter.flash_attn_varlen_func(
+        q=q.squeeze(0),
+        k=k.squeeze(0),
+        v=v.squeeze(0),
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=seqlen,
+        max_seqlen_k=seqlen,
+        min_seqlen_q=1,
+        dropout_p=0.0,
+        softmax_scale=d_qk**-0.5,
+        causal=True,
+        window_size=(127, 0),
+        return_lse=False,
+        out=output,
+        sink_ptr=sink,
+    )
+    reference, _, _ = attention_ref(q, k, v, causal=True, sink=sink)
+
+    torch.testing.assert_close(
+        output,
+        reference.squeeze(0),
+        atol=2e-2,
+        rtol=2e-2,
+    )

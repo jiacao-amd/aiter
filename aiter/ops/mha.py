@@ -1936,6 +1936,7 @@ def _flash_attn_forward(
             gqa_ratio = nhead_q // nhead_k
             ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
         if hdim_q == 192 and hdim_v == 128:
+            ret = ret and sink_ptr is None
             ret = ret and not _fmha_kv_byte_extent_ge_u32(seqlen_k, k, v)
         return ret
 
@@ -3002,6 +3003,7 @@ def _flash_attn_varlen_forward(
             gqa_ratio = nhead_q // nhead_k
             ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
         if hdim_q == 192 and hdim_v == 128 and block_table is None:
+            ret = ret and sink_ptr is None
             ret = ret and not _fmha_kv_byte_extent_ge_u32(max_seqlen_k, k, v)
         return ret
 
@@ -3157,9 +3159,9 @@ def _flash_attn_varlen_forward(
             assert t.is_cuda, f"{name} must be on CUDA"
             assert t.dtype == torch.int32, f"{name} must be int32, actual: {t.dtype}"
             assert t.is_contiguous(), f"{name} must be contiguous"
-            assert (
-                t.numel() == cu_seqlens_q.numel()
-            ), f"{name} length mismatch with batch"
+            assert t.numel() == cu_seqlens_q.numel(), (
+                f"{name} length mismatch with batch"
+            )
             # light monotonic check (first and last only; deeper check in C++)
             assert t[0].item() == 0, f"{name}[0] must be 0"
 

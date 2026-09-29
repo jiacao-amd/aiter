@@ -137,13 +137,15 @@ def compile_pa_decode_ps_reduce(
         offset for offset in (32, 16, 8, 4, 2, 1) if offset < reduce_width
     ]
 
-    # D128 splits partition ranges across wave pairs, one wave per 64 outputs.
+    # D128 splits partition ranges across waves and launches one CTA per
+    # 64-element output tile. This doubles the low-batch grid while keeping
+    # each CTA at or below eight waves.
     use_parallel_lds = head_size == 128 and max_context_partition_num > warp_size
     parallel_groups = 1
     if use_parallel_lds:
         parallel_groups = 2 if max_context_partition_num <= 96 else 8
     head_waves = head_size // warp_size
-    worker_waves = head_waves * parallel_groups
+    worker_waves = parallel_groups if use_parallel_lds else head_waves
     block_shape = (
         [warp_size, worker_waves, 1]
         if use_parallel_lds
@@ -155,7 +157,7 @@ def compile_pa_decode_ps_reduce(
 
     # SharedStorage is allocated only by the parallel branch.
     shared_weight_elems = max_context_partition_num if use_parallel_lds else 1
-    shared_partial_elems = (parallel_groups - 1) * head_size if use_parallel_lds else 1
+    shared_partial_elems = (parallel_groups - 1) * warp_size if use_parallel_lds else 1
 
     @fx.struct
     class SharedStorage:
@@ -188,6 +190,9 @@ def compile_pa_decode_ps_reduce(
         batch_idx = fx.block_idx.x
         kv_head_idx = fx.block_idx.y
         eqgs_idx = fx.block_idx.z
+        if fx.const_expr(use_parallel_lds):
+            output_tile = eqgs_idx % fx.Int32(head_waves)
+            eqgs_idx = eqgs_idx // fx.Int32(head_waves)
 
         output = fx.recast_iter(output_dtype, output_ptr)
         exp_sums = fx.recast_iter(fx.Float32, exp_sums_ptr)
@@ -488,9 +493,8 @@ def compile_pa_decode_ps_reduce(
 
             fx.gpu.barrier()
 
-            head_wave = worker % fx.Int32(head_waves)
-            partition_group = worker // fx.Int32(head_waves)
-            output_element = head_wave * c_warp_size + lane
+            partition_group = worker
+            output_element = output_tile * c_warp_size + lane
             group_part_begin = partition_group * fx.Int32(parts_per_group)
             acc = zero_f
             if fx.const_expr(use_work_plan):
@@ -528,14 +532,14 @@ def compile_pa_decode_ps_reduce(
             if partition_group > zero_i:
                 if fx.const_expr(use_work_plan):
                     if group_in_range:
-                        partial_offset = (partition_group - fx.Int32(1)) * fx.Int32(
-                            head_size
-                        ) + output_element
+                        partial_offset = (
+                            partition_group - fx.Int32(1)
+                        ) * c_warp_size + lane
                         lds_partials[partial_offset] = acc
                 else:
-                    partial_offset = (partition_group - fx.Int32(1)) * fx.Int32(
-                        head_size
-                    ) + output_element
+                    partial_offset = (
+                        partition_group - fx.Int32(1)
+                    ) * c_warp_size + lane
                     lds_partials[partial_offset] = acc
 
             fx.gpu.barrier()
@@ -545,13 +549,11 @@ def compile_pa_decode_ps_reduce(
                     if fx.const_expr(use_work_plan):
                         if fx.Int32(other_group * parts_per_group) < c_part_num:
                             partial_offset = (
-                                fx.Int32((other_group - 1) * head_size) + output_element
+                                fx.Int32((other_group - 1) * warp_size) + lane
                             )
                             acc = acc + fx.Float32(lds_partials[partial_offset])
                     else:
-                        partial_offset = (
-                            fx.Int32((other_group - 1) * head_size) + output_element
-                        )
+                        partial_offset = fx.Int32((other_group - 1) * warp_size) + lane
                         acc = acc + fx.Float32(lds_partials[partial_offset])
 
         elif fx.const_expr(max_context_partition_num <= warp_size):
@@ -858,7 +860,13 @@ def compile_pa_decode_ps_reduce(
             query_group_size,
             reduce_info,
         ).launch(
-            grid=(batch_size, num_kv_heads, query_seq_len * query_group_size),
+            grid=(
+                batch_size,
+                num_kv_heads,
+                query_seq_len
+                * query_group_size
+                * (head_waves if use_parallel_lds else 1),
+            ),
             block=tuple(block_shape),
             stream=stream,
         )
